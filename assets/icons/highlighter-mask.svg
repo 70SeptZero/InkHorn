@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>荧光笔的改色遮罩：笔身和笔尖</title>
+  <path id="highlighter-body-mask" d="M20.675 6.675h8.65v18.65h-8.65z" fill="#FFFFFF"/>
+  <path id="highlighter-tip-mask" d="M4.309 13.175h4.016v5.65h-5.63l1.614-5.65Z" fill="#FFFFFF"/>
+</svg>

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>笔的改色遮罩：笔身和笔尖</title>
+  <path id="pen-body-mask" d="M20.675 9.675h8.65v12.65h-8.65z" fill="#FFFFFF"/>
+  <path id="pen-tip-mask" d="M7.325 14.442v3.116l-4.108-1.396a.175.175 0 0 1 0-.324l4.108-1.396Z" fill="#FFFFFF"/>
+</svg>

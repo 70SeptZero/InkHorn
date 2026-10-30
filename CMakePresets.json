@@ -1,0 +1,10 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {"name":"release","displayName":"InkHorn · Windows x64 单 EXE","generator":"Ninja","binaryDir":"${sourceDir}/build/release","cacheVariables":{"CMAKE_BUILD_TYPE":"Release","INKHORN_WITH_PDFIUM":"ON","INKHORN_DYNAMIC_PDFIUM":"OFF"}},
+    {"name":"debug","displayName":"InkHorn · MSVC x64 调试","inherits":"release","binaryDir":"${sourceDir}/build/clion-debug","cacheVariables":{"CMAKE_BUILD_TYPE":"Debug"}},
+    {"name":"ui-preview","displayName":"仅界面预览（没有 PDF 功能）","generator":"Ninja","binaryDir":"${sourceDir}/build/msvc-ui-preview","cacheVariables":{"CMAKE_BUILD_TYPE":"Debug","INKHORN_WITH_PDFIUM":"OFF"}}
+  ],
+  "buildPresets":[{"name":"release","configurePreset":"release"},{"name":"debug","configurePreset":"debug"},{"name":"ui-preview","configurePreset":"ui-preview"}],
+  "testPresets":[{"name":"release","configurePreset":"release","output":{"outputOnFailure":true}},{"name":"debug","configurePreset":"debug","output":{"outputOnFailure":true}}]
+}

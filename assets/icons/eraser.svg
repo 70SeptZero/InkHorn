@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>橡皮擦</title>
+  <path d="M18 5 28 15 17 26H11L4 19Z" fill="#C9C9C9" stroke="#171717" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M4 19 11 12 21 22 17 26H11Z" fill="#D898D7" stroke="#171717" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M17 26H28" stroke="#171717" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

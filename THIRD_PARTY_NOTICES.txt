@@ -1,0 +1,10 @@
+InkHorn uses PDFium, Copyright The PDFium Authors, under its BSD-style license,
+and PDFium's third-party dependencies under their respective licenses.
+
+The source preparation script collects the actual checked-out license texts into
+third_party/pdfium/THIRD_PARTY_NOTICES.txt. Release builds embed that full text in
+the executable, accessible from the file menu, Third-party notices.
+
+PDFium source and licensing: https://pdfium.googlesource.com/pdfium/
+
+This development placeholder is used only by builds that have no staged PDFium SDK.

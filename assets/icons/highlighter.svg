@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>水平朝左的荧光笔</title>
+  <path id="highlighter-body" d="M20 6h10v20H20V6Z" fill="#FFFF00" stroke="#111111" stroke-width="1.35" stroke-linejoin="round"/>
+  <path d="M20 6c-3 2.5-5 5.5-8 5.5H9v9h3c3 0 5 3 8 5.5V6Z" fill="#FFFFFF" stroke="#111111" stroke-width="1.35" stroke-linejoin="round"/>
+  <path id="highlighter-tip" d="M3.8 12.5H9v7H1.8l2-7Z" fill="#FFFF00" stroke="#111111" stroke-width="1.35" stroke-linejoin="miter"/>
+</svg>

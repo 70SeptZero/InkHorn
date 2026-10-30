@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>保存</title>
+  <path d="M5 4.5h18l4 4V27H5V4.5Z" fill="#FFFFFF" stroke="#171717" stroke-width="1.5" stroke-linejoin="miter"/>
+  <path d="M10 4.5h11v8H10z" fill="#C9C9C9" stroke="#171717" stroke-width="1.35"/>
+  <path d="M10 27v-9h12v9" fill="#FFFFFF" stroke="#171717" stroke-width="1.35"/>
+  <path d="M18 7v3" stroke="#171717" stroke-width="1.35"/>
+</svg>

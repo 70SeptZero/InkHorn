@@ -1,0 +1,2 @@
+#include <windows.h>
+200 RCDATA "@INKHORN_NOTICES_FILE@"

@@ -1,0 +1,79 @@
+# Build output and locally prepared dependencies
+/build/
+/build-*/
+/build-before-rename*/
+/cmake-build-*/
+/out/
+/dist/
+/third_party/pdfium/
+/third_party/source/
+
+# Local IDE / assistant configuration (standalone repository rules)
+.idea/
+.vs/
+.vscode/
+.codex/
+.agents/
+.aws/
+.cache/
+/CMakeUserPresets.json
+
+# Local credentials; retain configuration examples
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.pfx
+*.p12
+
+# OS and editor temporary files
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*.swo
+*~
+
+# CMake / CTest generated files (including accidental in-source builds)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+install_manifest.txt
+CPackConfig.cmake
+CPackSourceConfig.cmake
+_CPack_Packages/
+
+# Compiled output and local IDE state
+*.obj
+*.o
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.lib
+*.a
+*.dll
+*.exe
+*.exp
+*.res
+*.suo
+*.user
+
+# Logs, crash reports, Python environments, and application state
+*.log
+*.dmp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+InkHorn-data/
+

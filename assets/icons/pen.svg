@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>水平朝左的笔</title>
+  <path id="pen-body" d="M20 9h10v14H20V9Z" fill="#005B89" stroke="#111111" stroke-width="1.35" stroke-linejoin="round"/>
+  <path d="m20 9-12 4.5v5L20 23V9Z" fill="#FFFFFF" stroke="#111111" stroke-width="1.35" stroke-linejoin="round"/>
+  <path id="pen-tip" d="M8 13.5v5l-5-1.7a.85.85 0 0 1 0-1.6l5-1.7Z" fill="#005B89" stroke="#111111" stroke-width="1.35" stroke-linejoin="round"/>
+</svg>

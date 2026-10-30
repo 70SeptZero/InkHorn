@@ -1,0 +1,28 @@
+#include <windows.h>
+#pragma code_page(65001)
+#ifdef INKHORN_MANIFEST_IN_RC
+1 RT_MANIFEST "app.manifest"
+#endif
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "080404b0"
+  BEGIN
+   VALUE "FileDescription", "InkHorn\0"
+   VALUE "ProductName", "InkHorn\0"
+   VALUE "InternalName", "InkHorn\0"
+   VALUE "OriginalFilename", "InkHorn.exe\0"
+   VALUE "FileVersion", "0.1.0.0\0"
+   VALUE "ProductVersion", "0.1.0.0\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0804, 1200
+ END
+END

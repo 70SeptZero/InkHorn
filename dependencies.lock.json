@@ -1,0 +1,11 @@
+{
+  "pdfium": {
+    "repository": "https://pdfium.googlesource.com/pdfium.git",
+    "revision": "9c866a447ca929bac93ed7da5f957fddb16ccde9"
+  },
+  "depot_tools": {
+    "repository": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+    "revision": "889099791deff38466d471fa6590951c91a1d8ab"
+  },
+  "configuration": "Windows x64; complete static PDFium; no V8/XFA/Skia; MSVC STL; release static CRT"
+}

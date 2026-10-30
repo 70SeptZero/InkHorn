@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <title>整笔橡皮光标，定位点在左上角 (4,4)</title>
+  <circle cx="4" cy="4" r="2" fill="#FFFFFF" stroke="#596273" stroke-width="1.2"/>
+  <path d="M20 9 29 18 19 28H13L6 21Z" fill="#CED3DC" stroke="#596273" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M6 21 12 15 22 25 19 28H13Z" fill="#DDBBD2" stroke="#596273" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M19 28H29" stroke="#596273" stroke-width="1.4" stroke-linecap="round"/>
+</svg>
