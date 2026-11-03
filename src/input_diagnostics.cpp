@@ -36,6 +36,8 @@ bool InputDiagnostics::start(const std::filesystem::path &directory) {
         }
         started_ = GetTickCount64();
         lastUpdate_ = 0;
+        lastMouse_ = 0;
+        lastSource_ = ~0u;
         lastId_ = 0;
         lastFlags_ = lastMask_ = lastButtons_ = ~0u;
         lines_ = 0;
@@ -98,6 +100,25 @@ bool InputDiagnostics::pen(UINT message, const POINTER_PEN_INFO &p, const char *
             << p.pressure;
     last_ = display.str();
     return true;
+}
+void InputDiagnostics::mouseSource(UINT message, bool known, const INPUT_MESSAGE_SOURCE &source, bool accepted) {
+    if (!active())
+        return;
+    const auto now = GetTickCount64();
+    const DWORD device = known ? DWORD(source.deviceType) : 0;
+    if ((message == WM_MOUSEMOVE || message == WM_NCMOUSEMOVE) && device == lastSource_ &&
+        accepted == lastAccepted_ && now - lastMouse_ < 100)
+        return;
+    lastMouse_ = now;
+    lastSource_ = device;
+    lastAccepted_ = accepted;
+    const char *name = device == IMDT_TOUCHPAD ? "TOUCHPAD" : device == IMDT_MOUSE ? "MOUSE" :
+                       device == IMDT_PEN ? "PEN" : device == IMDT_TOUCH ? "TOUCH" : "UNAVAILABLE";
+    std::ostringstream out;
+    out << "MOUSE_SOURCE=" << name << " known=" << known << " accepted=" << accepted
+        << " origin=" << int(source.originId) << " message=0x" << std::hex << message
+        << " extraInfo=0x" << GetMessageExtraInfo();
+    write(out.str());
 }
 bool InputDiagnostics::message(UINT message, WPARAM w, LPARAM l, const char *surface) {
     if (!active())

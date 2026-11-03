@@ -12,6 +12,9 @@ class InputDiagnostics {
     std::filesystem::path file_;
     std::wstring last_;
     ULONGLONG started_{}, lastUpdate_{};
+    ULONGLONG lastMouse_{};
+    DWORD lastSource_{~0u};
+    bool lastAccepted_{};
     UINT lastId_{}, lastFlags_{~0u}, lastMask_{~0u}, lastButtons_{~0u};
     size_t lines_{};
     void write(const std::string &);
@@ -30,5 +33,6 @@ class InputDiagnostics {
     }
     bool pen(UINT message, const POINTER_PEN_INFO &, const char *surface = "main");
     bool message(UINT, WPARAM, LPARAM, const char *surface = "main");
+    void mouseSource(UINT, bool known, const INPUT_MESSAGE_SOURCE &, bool accepted);
 };
 } // namespace pb

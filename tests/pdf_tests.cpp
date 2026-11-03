@@ -10,7 +10,7 @@ void require(bool value, const char *message) {
     if (!value)
         throw std::runtime_error(message);
 }
-void fixture(const std::filesystem::path &path, int pageCount = 1, int rotate = 0) {
+void fixture(const std::filesystem::path &path, int pageCount = 1, int rotate = 0, bool withText = false) {
     std::string kids;
     for (int i = 0; i < pageCount; ++i)
         kids += std::to_string(3 + i * 2) + " 0 R ";
@@ -19,9 +19,10 @@ void fixture(const std::filesystem::path &path, int pageCount = 1, int rotate = 
                                             std::to_string(pageCount) + " >>"};
     for (int i = 0; i < pageCount; ++i) {
         objects.push_back("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Rotate " +
-                          std::to_string(rotate) + " /Resources << >> /Contents " +
+                          std::to_string(rotate) + " /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents " +
                           std::to_string(4 + i * 2) + " 0 R >>");
-        objects.push_back("<< /Length 0 >>\nstream\n\nendstream");
+        const std::string content = withText ? "BT /F1 12 Tf 20 360 Td (Hello wrapped) Tj 0 -16 Td (world) Tj 0 -40 Td (Next paragraph) Tj ET" : "";
+        objects.push_back("<< /Length " + std::to_string(content.size()) + " >>\nstream\n" + content + "\nendstream");
     }
     std::ostringstream pdf;
     pdf << "%PDF-1.7\n";
@@ -48,8 +49,11 @@ int main() {
         std::filesystem::create_directories(dir);
         auto source = dir / "input.pdf", saved = dir / "notes.pdf";
         auto book = dir / L"中文路径-120页.pdf", bookSaved = dir / "book-notes.pdf";
+        auto textSource = dir / "text.pdf", rotatedTextSource = dir / "rotated-text.pdf";
         fixture(source);
         fixture(book, 120, 90);
+        fixture(textSource, 120, 0, true);
+        fixture(rotatedTextSource, 1, 90, true);
         std::mutex mutex;
         std::condition_variable cv;
         std::deque<std::shared_ptr<Result>> results;
@@ -170,12 +174,68 @@ int main() {
             }
             require(newest, "latest render completion");
             engine.close(5);
+            engine.open(6, textSource);
+            await(Result::Type::Opened);
+            auto started = std::chrono::steady_clock::now();
+            size_t totalMatches = 0;
+            for (int page = 0; page < 120; ++page) {
+                engine.text(6, page, uint64_t(page + 1), L"wrapped world");
+                auto text = await(Result::Type::Text);
+                require(text->error.empty() && text->text && text->text->copyAllowed,
+                        "read actual PDF text on background worker");
+                require(text->textTicket == uint64_t(page + 1) && text->textPage == page,
+                        "text request identity survives asynchronous delivery");
+                if (text->matches.size() != 1 || text->matches.front().boxes.size() != 2) {
+                    std::cout << "Text diagnostic: matches=" << text->matches.size() << '\n';
+                    for (const auto &c : text->text->characters)
+                        std::cout << unsigned(c.unicode) << " [" << c.box.l << ',' << c.box.t << ','
+                                  << c.box.r << ',' << c.box.b << "] visible=" << c.visible << '\n';
+                }
+                require(text->matches.size() == 1 && text->matches.front().boxes.size() == 2,
+                        "PDFium generated line breaks must be searchable");
+                auto &m = text->matches.front();
+                require(selectedText(*text->text, m.first, m.last) == L"wrapped\r\nworld",
+                        "PDF selection preserves its source text");
+                require(findText(*text->text, L"world Next").empty(), "real PDF paragraph gap");
+                totalMatches += text->matches.size();
+            }
+            std::cout << "Text: 120 pages, " << totalMatches << " matches in "
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
+                      << " ms (sequential background extraction/search)\n";
+            engine.open(7, rotatedTextSource);
+            auto rotatedInfo = await(Result::Type::Opened);
+            engine.text(7, 0, 500, L"Hello");
+            auto rotatedText = await(Result::Type::Text);
+            require(rotatedText->text && rotatedText->matches.size() == 1, "rotated PDF text extraction");
+            if (findText(*rotatedText->text, L"wrapped world").size() != 1 ||
+                !findText(*rotatedText->text, L"world Next").empty()) {
+                std::cout << "Rotated text diagnostic:\n";
+                for (const auto &c : rotatedText->text->characters)
+                    std::cout << unsigned(c.unicode) << " paragraph=" << c.paragraphBefore << '\n';
+            }
+            require(findText(*rotatedText->text, L"wrapped world").size() == 1 &&
+                        findText(*rotatedText->text, L"world Next").empty(),
+                    "paragraph inference is independent of display rotation");
+            const auto &box = rotatedText->text->characters.front().box;
+            require(box.l > 300 && box.l < 380 && box.t >= 19 && box.t < 30 &&
+                        box.r < rotatedInfo->info.pages[0].w && box.b < rotatedInfo->info.pages[0].h,
+                    "rotated glyph boxes use displayed page coordinates");
+            require(rotatedText->text->hit({(box.l + box.r) / 2, (box.t + box.b) / 2}, 0) == 0,
+                    "rotated glyph hit test agrees with PDFium page mapping");
+            engine.render(7, 0, 1);
+            auto afterText = await(Result::Type::Rendered);
+            require(afterText->bitmap.width == 400 && afterText->bitmap.height == 300,
+                    "text parsing restores the page rotation before rendering");
+            engine.close(6);
+            engine.close(7);
         }
         // Only delete the explicitly generated files, no recursive filesystem removal.
         std::filesystem::remove(source);
         std::filesystem::remove(saved);
         std::filesystem::remove(book);
         std::filesystem::remove(bookSaved);
+        std::filesystem::remove(textSource);
+        std::filesystem::remove(rotatedTextSource);
         std::filesystem::remove(dir);
         std::cout << "PASS: real PDF open/render/save/reopen, Ink/Marker/Square/Circle, move/delete\n";
         return 0;

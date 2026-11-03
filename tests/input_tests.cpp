@@ -6,6 +6,17 @@
 using namespace pb;
 int main() {
     try {
+        for (UINT message : {WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_MOUSEHWHEEL}) {
+            if (!acceptMouseInput(message, 0xff515780, false, true, true, IMDT_TOUCHPAD) ||
+                !acceptMouseInput(message, 0, false, true, true, IMDT_MOUSE) ||
+                acceptMouseInput(message, 0xff515780, false, true, true, IMDT_TOUCH) ||
+                acceptMouseInput(message, 0, false, true, true, IMDT_PEN) ||
+                acceptMouseInput(message, 0, true, true, true, IMDT_TOUCHPAD))
+                throw std::runtime_error("touchpad must restore pointer, but pen contact must retain ownership");
+        }
+        if (acceptMouseInput(WM_MOUSEMOVE, 0, false, true, false, IMDT_UNAVAILABLE) ||
+            acceptMouseInput(WM_MOUSEMOVE, 0xff515780, false, true, false, IMDT_UNAVAILABLE))
+            throw std::runtime_error("synthetic or unclassified promoted moves must not interrupt pen hover");
         for (int selected = 0; selected <= 5; ++selected) {
             InputToolMode mode;
             int tool = 0;
@@ -95,13 +106,15 @@ int main() {
         diagnostics.message(WM_KEYDOWN, 'Z', 0);
         diagnostics.message(WM_KEYUP, 'Z', 0, "edit");
         diagnostics.message(WM_RBUTTONDOWN, 0, 0);
+        INPUT_MESSAGE_SOURCE source{IMDT_TOUCHPAD, IMO_HARDWARE};
+        diagnostics.mouseSource(WM_MOUSEMOVE, true, source, true);
         const auto file = diagnostics.file();
         diagnostics.stop();
         std::ifstream input(file, std::ios::binary);
         const std::string text((std::istreambuf_iterator<char>(input)), {});
         input.close();
         for (const auto *value : {"ERASER=1", "BARREL=1", "INVERTED=1", "pressure=512", "KEY_DOWN",
-                                  "edit KEY_UP", "MOUSE_RIGHT_DOWN", "STOP"})
+                                  "edit KEY_UP", "MOUSE_RIGHT_DOWN", "MOUSE_SOURCE=TOUCHPAD", "accepted=1", "STOP"})
             if (text.find(value) == std::string::npos)
                 throw std::runtime_error("diagnostic log lost input evidence");
         std::filesystem::remove(file);

@@ -14,6 +14,19 @@ inline bool mouseInputMessage(UINT message) {
            (message >= WM_NCLBUTTONDOWN && message <= WM_NCMBUTTONDBLCLK) ||
            (message >= WM_NCXBUTTONDOWN && message <= WM_NCXBUTTONDBLCLK);
 }
+inline bool acceptMouseInput(UINT message, LPARAM extra, bool contact, bool penMode,
+                             bool known, INPUT_MESSAGE_DEVICE_TYPE source) {
+    if (contact)
+        return false;
+    // Precision touchpads can carry the pointer-promotion signature too.
+    // Windows' explicit device classification takes precedence over that tag.
+    if (known && source == IMDT_TOUCHPAD)
+        return true;
+    if (promotedPointerMouse(extra) || (known && (source == IMDT_PEN || source == IMDT_TOUCH)))
+        return false;
+    return !penMode || (message != WM_MOUSEMOVE && message != WM_NCMOUSEMOVE) ||
+           (known && source != IMDT_UNAVAILABLE);
+}
 // Tool selection is shared. Only a device transition supplies a default; repeated
 // hover/move messages must not overwrite an explicit selection or repaint UI.
 class InputToolMode {

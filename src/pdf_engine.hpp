@@ -1,5 +1,6 @@
 #pragma once
 #include "core.hpp"
+#include "pdf_text.hpp"
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -25,7 +26,7 @@ struct Bitmap {
     std::vector<uint8_t> pixels;
 };
 struct Result {
-    enum class Type { Opened, Rendered, Saved, Failed } type{Type::Failed};
+    enum class Type { Opened, Rendered, Saved, Text, Failed } type{Type::Failed};
     uint64_t document{};
     DocumentInfo info;
     Bitmap bitmap;
@@ -35,6 +36,10 @@ struct Result {
     uintmax_t sourceSize{};
     std::wstring error;
     uint64_t renderTicket{};
+    uint64_t textTicket{};
+    int textPage{-1};
+    std::shared_ptr<PageText> text;
+    std::vector<TextMatch> matches;
 };
 class PdfEngine {
   public:
@@ -44,6 +49,8 @@ class PdfEngine {
     void open(uint64_t, const std::filesystem::path &);
     void render(uint64_t, int, double, bool includeSavedAnnotations = false, uint64_t ticket = 0);
     void cancelRender(uint64_t);
+    void text(uint64_t, int page, uint64_t ticket, const std::wstring &query = {});
+    void cancelText(uint64_t);
     void save(uint64_t, std::vector<Stroke>, std::string, const std::filesystem::path &target = {});
     void close(uint64_t);
 

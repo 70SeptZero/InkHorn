@@ -226,6 +226,10 @@ void toolGlyph(ID2D1RenderTarget *rt, ID2D1SolidColorBrush *brush, ID2D1StrokeSt
         rect(8, 3, 16, 9, 1);
         rect(8, 15, 16, 21, 1);
         break;
+    case 14:
+        rt->DrawEllipse(D2D1::Ellipse(p(10, 10), 6.5f * unit, 6.5f * unit), brush, 1.65f * unit, style);
+        line(15, 15, 21, 21, 2);
+        break;
     // Shape choices in the popup.
     case 9:
         rt->DrawEllipse(D2D1::Ellipse(p(12, 12), 8 * unit, 8 * unit), brush, 1.65f * unit, style);

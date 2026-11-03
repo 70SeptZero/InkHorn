@@ -12,6 +12,7 @@
 #include <fpdf_progressive.h>
 #include <fpdf_save.h>
 #include <fpdf_signature.h>
+#include <fpdf_text.h>
 #include <fpdfview.h>
 #endif
 
@@ -69,7 +70,10 @@ struct PdfEngine::Impl {
                                     X(FPDFAnnot_AppendObject) X(FPDFPageObj_Destroy) X(FPDF_SaveAsCopy)      \
                                         X(FPDF_DeviceToPage) X(FPDFAnnot_SetAP) X(FPDF_GetDocPermissions)    \
                                             X(FPDF_GetSignatureCount) X(FPDF_RenderPageBitmap_Start)         \
-                                                X(FPDF_RenderPage_Continue) X(FPDF_RenderPage_Close)
+                                                X(FPDF_RenderPage_Continue) X(FPDF_RenderPage_Close) \
+    X(FPDFText_LoadPage) X(FPDFText_ClosePage) X(FPDFText_CountChars) X(FPDFText_GetUnicode) \
+    X(FPDFText_GetCharBox) X(FPDFText_GetFontSize) X(FPDF_PageToDevice) \
+    X(FPDFPage_GetRotation) X(FPDFPage_SetRotation)
     struct Api {
 #define PB_DECLARE(name) decltype(&::name) name{};
         PB_API_LIST(PB_DECLARE)
@@ -245,6 +249,83 @@ struct PdfEngine::Impl {
             std::copy_n(src + size_t(y) * stride, size_t(w) * 4, r->bitmap.pixels.data() + size_t(y) * w * 4);
         if (!cancel->load())
             callback(r);
+    }
+    void readText(uint64_t id, int index, uint64_t ticket, const std::wstring &query) {
+        auto r = std::make_shared<Result>();
+        r->type = Result::Type::Text;
+        r->document = id;
+        r->textTicket = ticket;
+        r->textPage = index;
+        try {
+            auto &d = docs.at(id);
+            if (index < 0 || index >= int(d.info.pages.size()))
+                throw std::runtime_error("文字页码无效。");
+            auto p = api.FPDF_LoadPage(d.handle, index);
+            if (!p)
+                throw std::runtime_error("无法读取文字页面。");
+            Finally pageEnd{[&] { api.FPDF_ClosePage(p); }};
+            // Parse in the page's natural reading orientation. PDFium otherwise
+            // reverses line/column ordering on pages with a /Rotate entry.
+            int rotation = api.FPDFPage_GetRotation(p);
+            if (rotation)
+                api.FPDFPage_SetRotation(p, 0);
+            auto t = api.FPDFText_LoadPage(p);
+            if (rotation)
+                api.FPDFPage_SetRotation(p, rotation);
+            if (!t)
+                throw std::runtime_error("无法读取 PDF 文字层。");
+            Finally textEnd{[&] { api.FPDFText_ClosePage(t); }};
+            int count = api.FPDFText_CountChars(t);
+            if (count < 0 || count > 100000)
+                throw std::runtime_error("该页文字过密，已跳过以限制内存与处理时间。");
+            r->text = std::make_shared<PageText>();
+            r->text->page = index;
+            r->text->boundariesKnown = true;
+            r->text->copyAllowed = (api.FPDF_GetDocPermissions(d.handle) & (1u << 4)) != 0;
+            r->text->characters.reserve(count);
+            const auto size = d.info.pages[index];
+            int width = std::max(1, int(size.w * 100)), height = std::max(1, int(size.h * 100));
+            Bounds previous{};
+            double previousEm = 0;
+            bool havePrevious = false, lineBreak = false;
+            for (int i = 0; i < count; ++i) {
+                TextCharacter c;
+                c.unicode = api.FPDFText_GetUnicode(t, i);
+                if (c.unicode == U'\r' || c.unicode == U'\n')
+                    lineBreak = true;
+                double l = 0, right = 0, bottom = 0, top = 0;
+                if (api.FPDFText_GetCharBox(t, i, &l, &right, &bottom, &top) &&
+                    std::isfinite(l) && std::isfinite(right) && std::isfinite(bottom) && std::isfinite(top)) {
+                    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                    if (api.FPDF_PageToDevice(p, 0, 0, width, height, 0, l, top, &x1, &y1) &&
+                        api.FPDF_PageToDevice(p, 0, 0, width, height, 0, right, bottom, &x2, &y2)) {
+                        c.box = {std::min(x1, x2) / 100.0, std::min(y1, y2) / 100.0,
+                                 std::max(x1, x2) / 100.0, std::max(y1, y2) / 100.0};
+                        c.visible = c.unicode && !textSpace(c.unicode) && c.box.r > c.box.l && c.box.b > c.box.t;
+                        if (c.visible) {
+                            // Paragraph geometry must be evaluated before page rotation.
+                            Bounds flow{l, -top, right, -bottom};
+                            double em = std::max({1.0, api.FPDFText_GetFontSize(t, i), top - bottom});
+                            double h = std::max(em, previousEm);
+                            c.paragraphBefore = lineBreak && havePrevious &&
+                                (flow.t - previous.b > h * 1.2 || flow.t < previous.t - h ||
+                                 flow.l > previous.r + h * 3);
+                            previous = flow;
+                            previousEm = em;
+                            havePrevious = true;
+                            lineBreak = false;
+                        }
+                    }
+                }
+                r->text->characters.push_back(c);
+            }
+            if (!query.empty())
+                r->matches = findText(*r->text, query);
+        } catch (const std::exception &e) {
+            r->text.reset();
+            r->error = widen(e.what());
+        }
+        callback(r);
     }
     Point toPdf(FPDF_PAGE page, Size size, Point q) {
         // Use the engine's page mapping, including CropBox, Rotate and UserUnit.
@@ -460,6 +541,7 @@ struct PdfEngine::Impl {
                     RuntimeStage stage(RuntimeThread::Pdf, t.type == 0   ? "pdf.open"
                                                            : t.type == 1 ? "pdf.render"
                                                            : t.type == 2 ? "pdf.save"
+                                                           : t.type == 4 ? "pdf.text"
                                                                          : "pdf.close");
                     t.run();
                 } catch (const std::exception &e) {
@@ -487,7 +569,7 @@ struct PdfEngine::Impl {
                 (void)id;
                 cancel->store(true);
             }
-            std::erase_if(queue, [](const Task &task) { return task.type == 1; });
+            std::erase_if(queue, [](const Task &task) { return task.type == 1 || task.type == 4; });
         }
         cv.notify_one();
         worker.join();
@@ -514,7 +596,12 @@ struct PdfEngine::Impl {
                 renderCancellation.erase(id);
             std::erase_if(queue, [&](const Task &t) { return t.type == 1 && t.id == id; });
         }
-        queue.push_back({type, id, std::move(task), ticket});
+        // Rendering, saving and closing take priority over background text work.
+        if (type == 3)
+            std::erase_if(queue, [&](const Task &t) { return t.type == 4 && t.id == id; });
+        auto position = type == 4 ? queue.end() : std::find_if(queue.begin(), queue.end(),
+                                                              [](const Task &t) { return t.type == 4; });
+        queue.insert(position, {type, id, std::move(task), ticket});
         cv.notify_one();
     }
 };
@@ -549,6 +636,26 @@ void PdfEngine::cancelRender(uint64_t id) {
     if (auto found = impl_->renderCancellation.find(id); found != impl_->renderCancellation.end())
         found->second->store(true);
     std::erase_if(impl_->queue, [&](const auto &task) { return task.type == 1 && task.id == id; });
+}
+void PdfEngine::text(uint64_t id, int page, uint64_t ticket, const std::wstring &query) {
+    impl_->post(4, id, [this, id, page, ticket, query] {
+#if INKHORN_WITH_PDFIUM
+        impl_->readText(id, page, ticket, query);
+#else
+        auto r = std::make_shared<Result>();
+        r->type = Result::Type::Text;
+        r->document = id;
+        r->textPage = page;
+        r->textTicket = ticket;
+        r->error = L"PDF support is disabled.";
+        impl_->callback(r);
+        (void)query;
+#endif
+    });
+}
+void PdfEngine::cancelText(uint64_t id) {
+    std::lock_guard lock(impl_->mutex);
+    std::erase_if(impl_->queue, [&](const auto &task) { return task.type == 4 && task.id == id; });
 }
 void PdfEngine::save(uint64_t id, std::vector<Stroke> strokes, std::string fp,
                      const std::filesystem::path &target) {

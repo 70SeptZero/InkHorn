@@ -9,6 +9,7 @@
 #include "runtime_trace.hpp"
 #include "storage.hpp"
 #include "ui.hpp"
+#include "window_routing.hpp"
 #include <array>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -30,7 +31,9 @@
 namespace pb {
 using Microsoft::WRL::ComPtr;
 constexpr UINT resultMessage = WM_APP + 12;
-constexpr int pageId = 101, zoomId = 102;
+constexpr UINT openDocumentsMessage = WM_APP + 13, cleanupWindowsMessage = WM_APP + 14;
+constexpr UINT mergeWindowsMessage = WM_APP + 15;
+constexpr int pageId = 101, zoomId = 102, searchId = 103;
 struct CachedPage {
     Bitmap cpu;
     ComPtr<ID2D1Bitmap> gpu;
@@ -45,12 +48,31 @@ struct Session {
     int page{}, pending{-1};
     uint64_t pendingTicket{};
     std::map<int, CachedPage> cache;
+    std::map<int, std::shared_ptr<PageText>> textCache;
+    std::set<int> textErrors;
+    int pendingText{-1}, searchPage{}, searchIndex{-1}, searchSkipped{};
+    uint64_t textTicket{};
+    bool pendingSearch{}, searchLimited{};
+    std::wstring query;
+    std::vector<TextMatch> matches;
+    int selectionPage{-1}, selectionFirst{-1}, selectionLast{-1};
     int64_t sourceStamp{};
     uintmax_t sourceSize{};
 };
 struct App {
+    static inline HWND broker{};
+    static inline App *lastActive{};
+    static inline std::vector<App *> windows;
+    static inline std::vector<std::unique_ptr<App>> detached;
+    static inline std::shared_ptr<PdfEngine> sharedEngine;
+    static inline std::shared_ptr<Storage> sharedStorage;
+    static inline std::shared_ptr<RuntimeMonitor> sharedMonitor;
+    static inline size_t pendingOpenRequests{};
+    static inline std::vector<std::unique_ptr<std::vector<std::filesystem::path>>> deferredOpens;
     HINSTANCE instance{};
-    HWND window{}, pageEdit{}, zoomEdit{}, panel{};
+    HWND window{}, pageEdit{}, zoomEdit{}, searchEdit{}, panel{};
+    bool searchVisible{};
+    static inline uint64_t nextTextTicket{1};
     HFONT font{};
     UINT fontDpi{};
     ComPtr<ID2D1Factory> factory;
@@ -105,6 +127,43 @@ struct App {
     std::vector<MenuRow> menuRows;
     double menuScroll{};
     int menuHover{-1}, menuFocus{-1};
+    int mergeInsert{-1}, pendingMergeInsert{-1};
+    int fileDragCommand{};
+    UINT fileDragPointer{};
+    POINT fileDragStart{};
+    bool fileDragMoved{}, windowMoving{}, windowResizing{};
+    bool titlePressed{}, titleWasFilesOpen{};
+    POINT titlePressStart{};
+    HWND mergeSource{}, mergeTarget{};
+    ULONGLONG mergeHoverStart{};
+    SIZE moveSize{};
+    RECT moveStart{};
+    bool mergePreview{}, moveCancelled{};
+    LONG_PTR moveExStyle{};
+    COLORREF moveColorKey{};
+    BYTE moveAlpha{255};
+    DWORD moveLayerFlags{};
+    POINT dragProbePoint{};
+    bool dragProbeKnown{};
+    static constexpr UINT_PTR windowDragTimer = 5;
+    static void CALLBACK windowDragTick(HWND h, UINT, UINT_PTR id, DWORD) {
+        if (id == 4)
+            KillTimer(h, id);
+        auto *a = findWindow(h);
+        if (!a || !a->windowMoving || a->windowResizing || a->moveCancelled) {
+            KillTimer(h, id);
+            return;
+        }
+        POINT screen{};
+        if (!GetCursorPos(&screen))
+            return;
+        if (id == windowDragTimer && a->dragProbeKnown &&
+            screen.x == a->dragProbePoint.x && screen.y == a->dragProbePoint.y)
+            return;
+        a->dragProbePoint = screen;
+        a->dragProbeKnown = true;
+        a->updateMergeTarget(screen);
+    }
     int customColorIndex{7}, colorDrag{};
     Hsv draftColor;
     std::wstring draftHex;
@@ -125,13 +184,14 @@ struct App {
     };
     std::unordered_map<uint64_t, StrokeGeometry> shapes;
     InkTiles inkTiles;
-    std::unique_ptr<RuntimeMonitor> runtimeMonitor;
-    std::unique_ptr<PdfEngine> engine;
-    std::unique_ptr<Storage> storage;
+    std::shared_ptr<RuntimeMonitor> runtimeMonitor;
+    std::shared_ptr<PdfEngine> engine;
+    std::shared_ptr<Storage> storage;
     std::vector<Session> sessions;
     int active{-1}, tool{};
-    uint64_t nextDocument{1}, nextStroke{uint64_t(GetTickCount64()) << 16};
-    uint64_t nextRenderTicket{1};
+    static inline uint64_t nextDocument{1};
+    static inline uint64_t nextStroke{uint64_t(GetTickCount64()) << 16};
+    static inline uint64_t nextRenderTicket{1};
     std::array<Color, 8> palette{{{25, 25, 28, 255},
                                   {21, 101, 192, 255},
                                   {211, 47, 47, 255},
@@ -149,7 +209,7 @@ struct App {
     static constexpr double eraserWidth = 4;
     std::array<double, 6> widths{{1.5, 1.5, 1.5, eraserWidth, 12, 1.5}};
     Kind shapeKind{Kind::Rectangle};
-    enum class Gesture { None, Draw, Pan, Erase, Move, Toolbar } gesture{Gesture::None};
+    enum class Gesture { None, Draw, Pan, Erase, Move, Toolbar, Text } gesture{Gesture::None};
     Stroke workingStroke;
     std::vector<Stroke> erased;
     std::optional<uint64_t> selected;
@@ -163,6 +223,387 @@ struct App {
     std::wstring toast;
     bool toastWarning{};
     double toastUntil{};
+    static LRESULT CALLBACK brokerProc(HWND h, UINT message, WPARAM w, LPARAM l) {
+        if (message == WM_COPYDATA) {
+            if (windows.empty())
+                return 0;
+            auto paths = readOpenPayload(reinterpret_cast<const COPYDATASTRUCT *>(l));
+            if (!paths)
+                return 0;
+            auto request = std::make_unique<std::vector<std::filesystem::path>>(std::move(*paths));
+            if (!PostMessageW(h, openDocumentsMessage, 0, reinterpret_cast<LPARAM>(request.get())))
+                return 0;
+            request.release();
+            ++pendingOpenRequests;
+            return 1;
+        }
+        if (message == openDocumentsMessage) {
+            std::unique_ptr<std::vector<std::filesystem::path>> paths(
+                reinterpret_cast<std::vector<std::filesystem::path> *>(l));
+            const auto available = [](App *a) { return a && a->window && !a->closePrompt && !a->quitting; };
+            auto *a = available(lastActive) ? lastActive : nullptr;
+            if (!a)
+                for (auto *candidate : windows)
+                    if (available(candidate)) { a = candidate; break; }
+            if (!a && !windows.empty()) {
+                deferredOpens.push_back(std::move(paths));
+                SetTimer(h, 1, 100, nullptr);
+                return 0;
+            }
+            --pendingOpenRequests;
+            if (a) {
+                lastActive = a;
+                for (const auto &path : *paths)
+                    a->open(path);
+                auto *focus = lastActive ? lastActive : a;
+                if (IsIconic(focus->window))
+                    ShowWindow(focus->window, SW_RESTORE);
+                SetForegroundWindow(focus->window);
+            }
+            return 0;
+        }
+        if (message == WM_TIMER && w == 1) {
+            KillTimer(h, 1);
+            auto requests = std::move(deferredOpens);
+            deferredOpens.clear();
+            for (auto &request : requests)
+                if (PostMessageW(h, openDocumentsMessage, 0, reinterpret_cast<LPARAM>(request.get())))
+                    request.release();
+                else
+                    --pendingOpenRequests;
+            return 0;
+        }
+        if (message == resultMessage) {
+            std::unique_ptr<std::shared_ptr<Result>> result(reinterpret_cast<std::shared_ptr<Result> *>(l));
+            for (auto *a : windows) {
+                if ((!(*result)->document && a == windows.front()) ||
+                    std::any_of(a->sessions.begin(), a->sessions.end(),
+                                [&](const Session &s) { return s.id == (*result)->document; })) {
+                    a->result(std::move(*result));
+                    break;
+                }
+            }
+            return 0;
+        }
+        if (message == cleanupWindowsMessage) {
+            std::erase_if(detached, [](const auto &a) { return !a->window; });
+            return 0;
+        }
+        if (message == mergeWindowsMessage) {
+            auto *destination = findWindow(reinterpret_cast<HWND>(w));
+            auto *source = findWindow(reinterpret_cast<HWND>(l));
+            if (destination && source)
+                destination->mergeWindow(*source, std::exchange(source->pendingMergeInsert, -1));
+            return 0;
+        }
+        return DefWindowProcW(h, message, w, l);
+    }
+    static App *findWindow(HWND h) {
+        for (auto *a : windows)
+            if (h && a->window == h)
+                return a;
+        return nullptr;
+    }
+    bool canTransfer() const {
+        return window && !closePrompt && !quitting && !titlePressed && gesture == Gesture::None && !activePointer &&
+               !mouseContact && !penContact.active() &&
+               std::none_of(sessions.begin(), sessions.end(), [](const Session &s) {
+                   return s.loading || s.saving || s.closing;
+               });
+    }
+    void prepareTransfer(Session &session) {
+        engine->cancelRender(session.id);
+        engine->cancelText(session.id);
+        session.pending = session.pendingText = -1;
+        session.pendingTicket = session.textTicket = 0;
+        session.query.clear();
+        session.matches.clear();
+        // GPU resources belong to this window; CPU pages, history and text move intact.
+        for (auto &[page, cached] : session.cache) {
+            (void)page;
+            cached.gpu.Reset();
+        }
+        inkTiles.forget(session.id);
+    }
+    bool mergeWindow(App &source, int insert = -1) {
+        if (&source == this || source.sessions.empty() || !canTransfer() || !source.canTransfer()) {
+            closePanel();
+            showToast(L"请等待文档打开、保存或当前操作完成后再合并");
+            return false;
+        }
+        // Reserve before changing either owner. Never save/reopen a PDF to move it.
+        const auto previousSize = sessions.size();
+        const auto position = insert < 0 ? previousSize : std::min(size_t(insert), previousSize);
+        sessions.reserve(previousSize + source.sessions.size());
+        closePanel();
+        closeSearch();
+        stopInertia();
+        rememberView();
+        source.closePanel();
+        source.closeSearch();
+        source.stopInertia();
+        source.rememberView();
+        const int incomingActive = int(position) + std::max(0, source.active);
+        for (auto &session : source.sessions) {
+            source.prepareTransfer(session);
+            sessions.push_back(std::move(session));
+        }
+        // Move the incoming block into the indicated gap, preserving order within both windows.
+        std::rotate(sessions.begin() + position, sessions.begin() + previousSize, sessions.end());
+        source.sessions.clear();
+        source.active = -1;
+        active = incomingActive;
+        selected.reset();
+        shapes.clear();
+        inkValid = liveValid = false;
+        source.clearMergeTarget();
+        DestroyWindow(source.window);
+        lastActive = this;
+        layout();
+        if (!smoke) {
+            ShowWindow(window, SW_SHOW);
+            SetForegroundWindow(window);
+        }
+        return true;
+    }
+    bool fileAreaContains(POINT screen) const {
+        if (!window || !header())
+            return false;
+        ScreenToClient(window, &screen);
+        const double x = screen.x / dpi(), y = screen.y / dpi();
+        return x >= fileLeft() && x <= fileEdge() && y >= 0 && y < header();
+    }
+    bool mergeListContains(POINT screen) const {
+        if (!panel || panelKind != PanelKind::Files)
+            return false;
+        RECT box{};
+        GetWindowRect(panel, &box);
+        return PtInRect(&box, screen) != FALSE;
+    }
+    void setMergePreview(bool enabled) {
+        if (mergePreview == enabled)
+            return;
+        mergePreview = enabled;
+        if (enabled) {
+            moveExStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            moveLayerFlags = 0;
+            moveAlpha = 255;
+            if (moveExStyle & WS_EX_LAYERED)
+                GetLayeredWindowAttributes(window, &moveColorKey, &moveAlpha, &moveLayerFlags);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, moveExStyle | WS_EX_LAYERED);
+            SetLayeredWindowAttributes(window, 0, 190, LWA_ALPHA);
+            if (moveSize.cx && moveSize.cy)
+                SetWindowPos(window, nullptr, 0, 0, LONG(moveSize.cx * .94), LONG(moveSize.cy * .94),
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            if (moveExStyle & WS_EX_LAYERED)
+                SetLayeredWindowAttributes(window, moveColorKey, moveAlpha, moveLayerFlags);
+            else
+                SetWindowLongPtrW(window, GWL_EXSTYLE, moveExStyle);
+            // Remove temporary shrink at the current drop location, without moving the window.
+            if (moveSize.cx && moveSize.cy)
+                SetWindowPos(window, nullptr, 0, 0, moveSize.cx, moveSize.cy,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    void clearMergeTarget() {
+        KillTimer(window, 4);
+        if (auto *destination = findWindow(mergeTarget); destination && destination->mergeSource == window) {
+            destination->closePanel();
+        }
+        mergeTarget = nullptr;
+        mergeHoverStart = 0;
+        setMergePreview(false);
+    }
+    void beginMergeHover(App &destination, ULONGLONG now) {
+        clearMergeTarget();
+        mergeTarget = destination.window;
+        mergeHoverStart = now;
+        destination.closePanel();
+        destination.mergeSource = window;
+        destination.invalidate();
+        setMergePreview(true);
+        SetTimer(window, 4, 300, windowDragTick);
+    }
+    App *findMergeTargetAt(POINT screen) const {
+        const bool nearTitle = std::any_of(windows.begin(), windows.end(), [&](const App *candidate) {
+            return candidate != this && IsWindowVisible(candidate->window) && !IsIconic(candidate->window) &&
+                   candidate->fileAreaContains(screen);
+        });
+        if (!nearTitle)
+            return nullptr;
+        for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT)) {
+            if (h == window || GetAncestor(h, GA_ROOTOWNER) == window || !IsWindowVisible(h) || IsIconic(h))
+                continue;
+            // Native dragging and desktop utilities can place transparent/cloaked surfaces above a title.
+            const auto exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            DWORD cloaked{};
+            if ((exStyle & WS_EX_TRANSPARENT) ||
+                (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked))
+                continue;
+            RECT box{};
+            GetWindowRect(h, &box);
+            if (!PtInRect(&box, screen))
+                continue;
+            // A taskbar/overlay can have a large bounding box but a tiny or nonrectangular region.
+            // In particular an auto-hidden primary taskbar may extend across a display boundary.
+            RECT regionBox{};
+            const int regionKind = GetWindowRgnBox(h, &regionBox);
+            const POINT local{screen.x - box.left, screen.y - box.top};
+            if (regionKind == NULLREGION || (regionKind != ERROR && !PtInRect(&regionBox, local)))
+                continue;
+            if (regionKind == COMPLEXREGION) {
+                if (HRGN region = CreateRectRgn(0, 0, 0, 0)) {
+                    const bool outside = GetWindowRgn(h, region) != ERROR && !PtInRegion(region, local.x, local.y);
+                    DeleteObject(region);
+                    if (outside)
+                        continue;
+                }
+            }
+            if (exStyle & WS_EX_LAYERED) {
+                BYTE alpha{};
+                COLORREF key{};
+                DWORD flags{};
+                if (GetLayeredWindowAttributes(h, &key, &alpha, &flags) && (flags & LWA_ALPHA) && !alpha)
+                    continue;
+            }
+            auto *candidate = findWindow(h);
+            return candidate && candidate != this && candidate->canTransfer() && candidate->fileAreaContains(screen)
+                       ? candidate : nullptr;
+        }
+        return nullptr;
+    }
+    void updateMergeTarget(POINT screen, ULONGLONG now = GetTickCount64()) {
+        if (sessions.empty() || !canTransfer()) {
+            clearMergeTarget();
+            return;
+        }
+        App *destination = findWindow(mergeTarget);
+        const bool inPanel = destination && destination->mergeListContains(screen);
+        if (!destination || destination->mergeSource != window || !destination->canTransfer() ||
+            (!inPanel && !destination->fileAreaContains(screen))) {
+            clearMergeTarget();
+            destination = findMergeTargetAt(screen);
+            if (destination)
+                beginMergeHover(*destination, now);
+        }
+        if (destination && !destination->panel && now - mergeHoverStart >= 300) {
+            KillTimer(window, 4);
+            destination->openPopup(PanelKind::Files, window);
+            if (destination->panel)
+                // Keep the moving window above the destination; only the independent menu is topmost.
+                SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (destination && destination->panel) {
+            ScreenToClient(destination->panel, &screen);
+            const int position = screen.x >= 0 && screen.x < destination->popupWidth() * destination->dpi() &&
+                                 screen.y >= 0 && screen.y < destination->popupHeight() * destination->dpi()
+                                     ? destination->mergeInsertionAt(screen.y / destination->dpi())
+                                     : int(destination->sessions.size());
+            if (destination->mergeInsert != position || destination->menuHover != -1) {
+                destination->mergeInsert = position;
+                destination->menuHover = -1;
+                InvalidateRect(destination->panel, nullptr, FALSE);
+            }
+        }
+    }
+    void endWindowMove(POINT screen, bool cancelled) {
+        KillTimer(window, windowDragTimer);
+        // Account for the final pointer position even if Windows coalesced the last move event.
+        if (!cancelled && mergeTarget)
+            updateMergeTarget(screen);
+        auto *destination = findWindow(mergeTarget);
+        const bool merge = !cancelled && destination && destination->mergeSource == window &&
+                           destination->canTransfer() && destination->mergeListContains(screen);
+        const HWND destinationWindow = destination ? destination->window : nullptr;
+        pendingMergeInsert = merge ? destination->mergeInsert : -1;
+        clearMergeTarget();
+        windowMoving = windowResizing = false;
+        layout();
+        if (merge)
+            // The broker transfers ownership after the native move loop has returned.
+            PostMessageW(broker, mergeWindowsMessage, reinterpret_cast<WPARAM>(destinationWindow),
+                         reinterpret_cast<LPARAM>(window));
+    }
+    App *detachDocument(int index, const POINT *drop = nullptr) {
+        if (index < 0 || index >= int(sessions.size()) || closePrompt)
+            return nullptr;
+        auto &session = sessions[index];
+        if (session.loading || session.saving || session.closing) {
+            showToast(L"请等待文档打开或保存完成后再拆分");
+            return nullptr;
+        }
+        finishGesture();
+        stopInertia();
+        closePanel();
+        closeSearch();
+        rememberView();
+        auto child = std::make_unique<App>();
+        child->instance = instance;
+        child->smoke = smoke;
+        child->factory = factory;
+        child->textFactory = textFactory;
+        child->format = format;
+        child->smallFormat = smallFormat;
+        child->homeTitle = homeTitle;
+        child->roundStyle = roundStyle;
+        auto *out = child.get();
+        RECT bounds{};
+        GetWindowRect(window, &bounds);
+        if (fullscreen || IsZoomed(window)) {
+            const LONG w = LONG((bounds.right - bounds.left) * .6);
+            const LONG h = LONG((bounds.bottom - bounds.top) * .6);
+            bounds.right = bounds.left + w;
+            bounds.bottom = bounds.top + h;
+        }
+        const LONG w = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+        POINT origin{bounds.left + 32, bounds.top + 32};
+        if (drop) {
+            origin = {drop->x - w / 4, drop->y - LONG(20 * dpi())};
+        }
+        auto h = CreateWindowExW(0, L"InkHornWindow", L"InkHorn", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                 origin.x, origin.y, w, height, nullptr, nullptr, instance, out);
+        if (!h)
+            return nullptr;
+        if (drop) {
+            RECT actual{};
+            GetWindowRect(h, &actual);
+            SetWindowPos(h, nullptr, drop->x - (actual.right - actual.left) / 4,
+                         drop->y - LONG(out->header() * out->dpi() / 2), 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        out->palette = palette;
+        out->colors = colors;
+        out->widths = widths;
+        out->shapeKind = shapeKind;
+        out->leftHand = leftHand;
+        out->dark = dark;
+        out->toolbarDraggable = toolbarDraggable;
+        out->recent = recent;
+        prepareTransfer(session);
+        out->sessions.push_back(std::move(session));
+        out->active = 0;
+        sessions.erase(sessions.begin() + index);
+        if (active == index)
+            active = sessions.empty() ? -1 : std::min(index, int(sessions.size() - 1));
+        else if (active > index)
+            --active;
+        selected.reset();
+        shapes.clear();
+        inkValid = liveValid = false;
+        detached.push_back(std::move(child));
+        MARGINS margins{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(h, &margins);
+        SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ShowWindow(h, smoke ? SW_HIDE : SW_SHOW);
+        layout();
+        out->layout();
+        if (!smoke)
+            SetForegroundWindow(h);
+        return out;
+    }
     void showToast(const std::wstring &message, bool warning = false) {
         toast = message;
         toastWarning = warning;
@@ -220,6 +661,7 @@ struct App {
     }
     void showClosePrompt(uint64_t id) {
         closePanel();
+        closeSearch();
         stopInertia();
         closePrompt = id;
         closePromptFocus = 2;
@@ -381,6 +823,9 @@ struct App {
             recent.resize(20);
         if (storage)
             storage->writeRecent(recent);
+        for (auto *other : windows)
+            if (other != this)
+                other->recent = recent;
     }
     void forgetRecent(const std::filesystem::path &path) {
         auto key = [](const std::filesystem::path &p) {
@@ -393,6 +838,9 @@ struct App {
         std::erase_if(recent, [&](const auto &item) { return key(item) == identity; });
         if (storage)
             storage->writeRecent(recent);
+        for (auto *other : windows)
+            if (other != this)
+                other->recent = recent;
         hoverControl = -1;
         showToast(L"文件不存在", true);
     }
@@ -494,9 +942,11 @@ struct App {
         }
     }
     double toolbarContentHeight() const {
-        return toolbarDraggable ? 464 : 448;
+        return toolbarDraggable ? 510 : 494;
     }
     int toolbarGlyph(int button) const {
+        if (button == 9)
+            return 14;
         if (button != 5)
             return button;
         switch (shapeKind) {
@@ -536,7 +986,7 @@ struct App {
         if (x < r.left || x > r.right || y < r.top || y > r.bottom)
             return -1;
         double yy = y - r.top - toolsTop() + panelScroll;
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 10; ++i) {
             double top = i * 46 + (i >= 6 ? 12 : 0);
             if (yy >= top && yy < top + 42)
                 return i;
@@ -575,9 +1025,23 @@ struct App {
     void updateCursorAt(double x, double y) {
         if (smoke)
             return;
+        const auto sb = searchBox();
+        if (searchVisible && x >= sb.left && x <= sb.right && y >= sb.top && y <= sb.bottom) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return;
+        }
         if (toolbarHandle(x, y) || gesture == Gesture::Toolbar) {
             SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
             return;
+        }
+        if (auto *s = doc(); s && tool == 0 && !closePrompt && y >= header() &&
+            !toolbarContains(x, y) && !s->loading) {
+            int page = pageAt(x, y);
+            auto found = s->textCache.find(page);
+            if (found != s->textCache.end() && found->second->hit(pagePoint(x, y, page)) >= 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                return;
+            }
         }
         const int effective = cursorTool(x, y);
         if (effective >= 0) {
@@ -599,6 +1063,8 @@ struct App {
     }
     void inputToolChanged() {
         selected.reset();
+        if (auto *s = doc())
+            s->selectionPage = -1;
         if (panel && (panelKind == PanelKind::Tool || panelKind == PanelKind::Color))
             closePanel();
         invalidate();
@@ -608,19 +1074,13 @@ struct App {
             inputToolChanged();
     }
     bool mouseInput(UINT message) {
-        if (promotedPointerMouse(GetMessageExtraInfo()) || penContact.active())
+        INPUT_MESSAGE_SOURCE source{};
+        const bool known = GetCurrentInputMessageSource(&source) != FALSE;
+        const bool accepted = acceptMouseInput(message, GetMessageExtraInfo(), penContact.active(),
+                                               inputToolMode.penActive(), known, source.deviceType);
+        diagnostics.mouseSource(message, known, source, accepted);
+        if (!accepted)
             return false;
-        if (inputToolMode.penActive()) {
-            INPUT_MESSAGE_SOURCE source{};
-            const bool known = GetCurrentInputMessageSource(&source) != FALSE;
-            if (known && (source.deviceType == IMDT_PEN || source.deviceType == IMDT_TOUCH))
-                return false;
-            // Layout/capture changes can synthesize mouse moves without a mouse
-            // actually moving. Do not let those undo a pen-hover tool switch.
-            if ((message == WM_MOUSEMOVE || message == WM_NCMOUSEMOVE) &&
-                (!known || source.deviceType == IMDT_UNAVAILABLE))
-                return false;
-        }
         const bool changed = inputToolMode.mouse(tool);
         penNear = penTemporaryEraser = penPositionKnown = false;
         if (changed)
@@ -677,9 +1137,10 @@ struct App {
                                    L"形状 · 再次点击设置",
                                    L"撤销 · Ctrl+Z",
                                    L"重做 · Ctrl+Y",
-                                   L"保存 · Ctrl+S"};
+                                   L"保存 · Ctrl+S",
+                                   L"搜索正文 · Ctrl+F"};
         const auto tb = toolbar();
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 10; ++i) {
             const double y = tb.top + toolsTop() + i * 46 + (i >= 6 ? 12 : 0) - panelScroll;
             const double top = std::max(double(tb.top) + toolsTop() - 2, y);
             const double bottom = std::min(double(tb.bottom) - 6, y + 42);
@@ -1093,7 +1554,7 @@ struct App {
         update(zoomEdit, enabled ? std::to_wstring(int(std::round(s->scale * 100))) + L"%" : L"—");
     }
     void layout() {
-        if (!window)
+        if (!window || (windowMoving && !windowResizing))
             return;
         stopInertia();
         if (gesture != Gesture::None)
@@ -1103,7 +1564,7 @@ struct App {
             HFONT next = CreateFontW(-MulDiv(14, currentDpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                      DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-            for (HWND edit : {pageEdit, zoomEdit})
+            for (HWND edit : {pageEdit, zoomEdit, searchEdit})
                 SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
             if (font)
                 DeleteObject(font);
@@ -1132,19 +1593,244 @@ struct App {
                    int(22 * factor), TRUE);
         ShowWindow(pageEdit, header() && !closePrompt ? SW_SHOW : SW_HIDE);
         ShowWindow(zoomEdit, header() && !closePrompt ? SW_SHOW : SW_HIDE);
+        const auto input = searchField();
+        const auto countBox = searchCountBox();
+        TEXTMETRICW metrics{};
+        auto dc = GetDC(window);
+        auto previousFont = SelectObject(dc, font);
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, previousFont);
+        ReleaseDC(window, dc);
+        const double fieldHeight = (metrics.tmHeight + 2.0) / factor;
+        MoveWindow(searchEdit, int((input.left + 4) * factor),
+                   int(((input.top + input.bottom - fieldHeight) / 2) * factor),
+                   int((countBox.left - 6 - (input.left + 4)) * factor), int(fieldHeight * factor), TRUE);
+        ShowWindow(searchEdit, searchVisible && !closePrompt ? SW_SHOW : SW_HIDE);
         clampScroll();
         updateFields();
         updateTooltips();
         invalidate();
         requestPage();
     }
+    D2D1_RECT_F searchBox() const {
+        return D2D1::RectF(float(width() - 382), float(header() + 8), float(width() - 16), float(header() + 78));
+    }
+    D2D1_RECT_F searchField() const {
+        const auto r = searchBox();
+        return D2D1::RectF(r.left + 8, r.top + 8, r.right - 112, r.top + 40);
+    }
+    D2D1_RECT_F searchCountBox() const {
+        const auto field = searchField();
+        const auto r = searchBox();
+        return D2D1::RectF(field.right - 76, r.top + 16, field.right - 10, r.top + 38);
+    }
+    D2D1_RECT_F searchButton(int index) const {
+        const auto r = searchBox();
+        const float x = r.right - 106 + index * 32;
+        return D2D1::RectF(x, r.top + 8, x + 32, r.top + 40);
+    }
+    bool searchKey(WPARAM key, bool ctrl, bool shift) {
+        if (key == 'A' && ctrl) {
+            SendMessageW(searchEdit, EM_SETSEL, 0, -1);
+            return true;
+        }
+        if (key == VK_ESCAPE) {
+            closeSearch();
+            return true;
+        }
+        if (key == VK_RETURN || key == VK_F3) {
+            navigateSearch(shift ? -1 : 1);
+            return true;
+        }
+        return false;
+    }
+    void closeSearch() {
+        searchVisible = false;
+        ShowWindow(searchEdit, SW_HIDE);
+        KillTimer(window, 3);
+        if (auto *s = doc()) {
+            engine->cancelText(s->id);
+            s->pendingText = -1;
+            s->textTicket = nextTextTicket++;
+            s->query.clear();
+            s->matches.clear();
+            s->searchIndex = -1;
+        }
+        if (GetFocus() == searchEdit)
+            SetFocus(window);
+        invalidate();
+    }
+    void openSearch() {
+        if (!doc() || doc()->loading || closePrompt)
+            return;
+        finishGesture();
+        stopInertia();
+        closePanel();
+        searchVisible = true;
+        layout();
+        SetFocus(searchEdit);
+        SendMessageW(searchEdit, EM_SETSEL, 0, -1);
+        if (doc()->query.empty())
+            restartSearch();
+    }
+    void restartSearch() {
+        KillTimer(window, 3);
+        auto *s = doc();
+        if (!searchVisible || !s || s->loading)
+            return;
+        wchar_t value[257]{};
+        GetWindowTextW(searchEdit, value, 257);
+        engine->cancelText(s->id);
+        s->textTicket = nextTextTicket++;
+        s->pendingText = -1;
+        s->query = value;
+        if (s->query.find_first_not_of(L" \t\r\n\u3000") == std::wstring::npos)
+            s->query.clear();
+        s->matches.clear();
+        s->searchPage = s->searchSkipped = 0;
+        s->searchIndex = -1;
+        s->searchLimited = false;
+        requestText();
+        invalidate();
+    }
+    void navigateSearch(int direction) {
+        auto *s = doc();
+        if (!s || s->matches.empty())
+            return;
+        stopInertia();
+        s->searchIndex = s->searchIndex < 0 ? (direction < 0 ? int(s->matches.size()) - 1 : 0)
+            : (s->searchIndex + direction + int(s->matches.size())) % int(s->matches.size());
+        const auto &m = s->matches[s->searchIndex];
+        s->page = m.page;
+        s->scroll = topOf(m.page) + m.boxes.front().t * s->scale - bodyHeight() * .3;
+        // Bring a match into view even at a horizontally scrolled large zoom.
+        s->horizontal = 0;
+        double x = pageLeft(m.page) + m.boxes.front().l * s->scale;
+        if (x > paperRight() - 40)
+            s->horizontal = x - paperLeft() - 40;
+        clampScroll();
+        requestPage();
+        invalidate();
+    }
+    void requestText() {
+        auto *s = doc();
+        if (smoke || (windowMoving && !windowResizing) || !s || s->loading || s->pendingText >= 0 ||
+            gesture != Gesture::None || penContact.active())
+            return;
+        int page = -1;
+        bool search = false;
+        // Visible text has priority over advancing the whole-document search.
+        if (tool == 0) {
+            std::vector<int> visible;
+            for (int i = 0; i < int(s->pages.size()); ++i) {
+                double y = header() + topOf(i) - s->scroll;
+                if (y + s->pages[i].h * s->scale >= header() && y <= height())
+                    visible.push_back(i);
+            }
+            std::stable_sort(visible.begin(), visible.end(), [&](int a, int b) {
+                return std::abs(a - s->page) < std::abs(b - s->page);
+            });
+            // Bound prefetch too, so tiny zooms cannot cause eviction/re-read loops.
+            if (visible.size() > 7)
+                visible.resize(7);
+            for (int candidate : visible)
+                if (!s->textCache.contains(candidate) && !s->textErrors.contains(candidate)) {
+                    page = candidate;
+                    break;
+                }
+        }
+        if (page < 0 && searchVisible && !s->query.empty() && !s->searchLimited &&
+            s->searchPage < int(s->pages.size())) {
+            page = s->searchPage;
+            search = true;
+        }
+        if (page < 0)
+            return;
+        s->pendingText = page;
+        s->pendingSearch = search;
+        s->textTicket = nextTextTicket++;
+        engine->text(s->id, page, s->textTicket, search ? s->query : L"");
+    }
+    void paintSearch() {
+        auto *s = doc();
+        if (!searchVisible || !s || closePrompt)
+            return;
+        const auto r = searchBox();
+        rect(D2D1::RectF(r.left + 1, r.top + 2, r.right + 1, r.bottom + 2), {0, 0, 0, 28}, 8);
+        rect(r, {252, 253, 255, 255}, 8);
+        rect(searchField(), {244, 246, 250, 255}, 4);
+        auto count = std::to_wstring(s->matches.empty() ? 0 : s->searchIndex + 1) + L"/" +
+                     std::to_wstring(s->matches.size()) + (s->searchLimited ? L"+" : L"");
+        const auto countAlignment = smallFormat->GetTextAlignment();
+        smallFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        text(count, searchCountBox(), Theme::muted, true);
+        smallFormat->SetTextAlignment(countAlignment);
+        centeredText(L"↑", searchButton(0), Theme::text, false, true);
+        centeredText(L"↓", searchButton(1), Theme::text, false, true);
+        centeredText(L"×", searchButton(2), Theme::text, false, true);
+        std::wstring status = L"输入文字查找 · Enter 下一项";
+        if (!s->query.empty()) {
+            if (!s->searchLimited && s->searchPage < int(s->pages.size()))
+                status = L"正在查找… " + std::to_wstring(s->searchPage) + L"/" + std::to_wstring(s->pages.size()) + L" 页";
+            else if (s->searchLimited)
+                status = L"已达 2000 项上限，请使用更具体的关键词";
+            else
+                status = s->matches.empty() ? L"未找到文字（扫描件需 OCR）" : L"Enter 下一项 · Shift+Enter 上一项";
+            if (s->searchSkipped)
+                status += L" · 跳过 " + std::to_wstring(s->searchSkipped) + L" 页";
+        }
+        text(status, D2D1::RectF(r.left + 12, r.top + 46, r.right - 10, r.bottom - 4), Theme::muted, true);
+    }
+    bool searchInput(double x, double y) {
+        const auto r = searchBox();
+        if (!searchVisible || x < r.left || x > r.right || y < r.top || y > r.bottom)
+            return false;
+        if (y >= searchButton(0).top && y <= searchButton(0).bottom && x >= searchButton(0).left) {
+            if (x >= searchButton(2).left)
+                closeSearch();
+            else
+                navigateSearch(x < searchButton(1).left ? -1 : 1);
+        } else
+            SetFocus(searchEdit);
+        return true;
+    }
+    void copyText() {
+        auto *s = doc();
+        if (!s || s->selectionPage < 0 || !s->textCache.contains(s->selectionPage))
+            return;
+        const auto &page = *s->textCache.at(s->selectionPage);
+        if (!page.copyAllowed) {
+            showToast(L"此 PDF 的权限不允许复制文字", true);
+            return;
+        }
+        auto value = selectedText(page, s->selectionFirst, s->selectionLast);
+        if (value.empty())
+            return;
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (value.size() + 1) * sizeof(wchar_t));
+        if (!memory)
+            return;
+        auto *data = GlobalLock(memory);
+        if (!data) { GlobalFree(memory); return; }
+        memcpy(data, value.c_str(), (value.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(memory);
+        if (!OpenClipboard(window)) {
+            GlobalFree(memory);
+            showToast(L"剪贴板暂时不可用，请重试", true);
+            return;
+        }
+        EmptyClipboard();
+        if (!SetClipboardData(CF_UNICODETEXT, memory))
+            GlobalFree(memory);
+        CloseClipboard();
+    }
     void requestPage() {
         RuntimeStage stage(RuntimeThread::Ui, "ui.page-request");
-        if (smoke)
+        if (smoke || (windowMoving && !windowResizing))
             return;
         auto *s = doc();
         if (!s || s->loading)
             return;
+        requestText();
         int nearest = pageAt(width() / 2, header() + bodyHeight() / 2, false);
         if (nearest >= 0)
             s->page = nearest;
@@ -1392,6 +2078,19 @@ struct App {
                         D2D1::RectF(float(left + 24), float(top + 24), float(left + w - 24), float(top + 55)),
                         {150, 155, 165, 255});
                 target->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                const auto highlight = [&](const std::vector<Bounds> &boxes, Color c) {
+                    for (const auto &b : boxes)
+                        rect(D2D1::RectF(float(left + b.l * s->scale), float(top + b.t * s->scale),
+                                         float(left + b.r * s->scale), float(top + b.b * s->scale)), c);
+                };
+                if (searchVisible)
+                    for (size_t m = 0; m < s->matches.size(); ++m)
+                        if (s->matches[m].page == i)
+                            highlight(s->matches[m].boxes, int(m) == s->searchIndex ? Color{255, 145, 25, 140}
+                                                                                   : Color{255, 220, 30, 95});
+                if (s->selectionPage == i && s->textCache.contains(i))
+                    highlight(textBoxes(*s->textCache.at(i), s->selectionFirst, s->selectionLast),
+                              {45, 125, 235, 95});
                 if (repaintInk)
                     inkTarget->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                 if (!s->hidden) {
@@ -1487,7 +2186,7 @@ struct App {
         target->PushAxisAlignedClip(
             D2D1::RectF(tb.left, tb.top + float(toolsTop() - 2), tb.right, tb.bottom - 6),
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 10; ++i) {
             float y = tb.top + float(toolsTop()) + float(i * 46 + (i >= 6 ? 12 : 0) - panelScroll);
             auto r = D2D1::RectF(tb.left + 6, y, tb.right - 6, y + 42);
             const Color glyphColor =
@@ -1506,7 +2205,7 @@ struct App {
             target->GetTransform(&previousTransform);
             target->SetTransform(toolbarIconTransform() * previousTransform);
             const int glyph = toolbarGlyph(i);
-            if (!icons.draw(target.Get(), glyph, glyphBox, glyphColor))
+            if (glyph == 14 || !icons.draw(target.Get(), glyph, glyphBox, glyphColor))
                 toolGlyph(target.Get(), brush.Get(), roundStyle.Get(), glyph, glyphBox, glyphColor);
             if (i == tool && configurableTool(i)) {
                 icons.draw(target.Get(), 12, D2D1::RectF(r.left - 2, y + 26, r.left + 14, y + 42),
@@ -1528,6 +2227,7 @@ struct App {
                 target->DrawLine(D2D1::Point2F(18, y), D2D1::Point2F(32, y), brush.Get(), 1.5f,
                                  roundStyle.Get());
             rect(D2D1::RectF(float(fileLeft()), 5, float(fileEdge()), 35),
+                 mergeSource ? Color{207, 225, 255, 255} :
                  hoverControl == 20 || (panel && panelKind == PanelKind::Files) ? Color{230, 235, 245, 255}
                                                                                 : Theme::inset,
                  11);
@@ -1567,6 +2267,7 @@ struct App {
         if (!notice.empty())
             text(notice, D2D1::RectF(40, float(height() - 29), float(width() - 130), float(height() - 5)),
                  {95, 105, 120, 255}, true);
+        paintSearch();
         paintTransientUI();
         paintClosePrompt();
         HRESULT hr = target->EndDraw();
@@ -1594,16 +2295,25 @@ struct App {
         stopInertia();
         if (file.empty())
             return;
+        closePanel();
         auto full = std::filesystem::absolute(file);
-        for (size_t i = 0; i < sessions.size(); ++i) {
-            std::error_code identityError;
-            if (sessions[i].path == full ||
-                std::filesystem::equivalent(sessions[i].path, full, identityError)) {
-                activate(int(i));
-                return;
+        for (auto *owner : windows)
+            for (size_t i = 0; i < owner->sessions.size(); ++i) {
+                std::error_code identityError;
+                if (owner->sessions[i].path == full ||
+                    std::filesystem::equivalent(owner->sessions[i].path, full, identityError)) {
+                    owner->activate(int(i));
+                    lastActive = owner;
+                    if (!smoke) {
+                        if (IsIconic(owner->window))
+                            ShowWindow(owner->window, SW_RESTORE);
+                        SetForegroundWindow(owner->window);
+                    }
+                    return;
+                }
             }
-        }
         finishGesture();
+        closeSearch();
         Session s;
         s.id = nextDocument++;
         s.path = full;
@@ -1622,6 +2332,7 @@ struct App {
         stopInertia();
         rememberView();
         closePanel();
+        closeSearch();
         if (auto *previous = doc(); previous && active != i) {
             engine->cancelRender(previous->id);
             previous->pending = -1;
@@ -1643,7 +2354,8 @@ struct App {
         if (as && out.empty())
             return;
         if (as)
-            for (const auto &other : sessions) {
+            for (auto *owner : windows)
+              for (const auto &other : owner->sessions) {
                 std::error_code ec;
                 if (other.id != s->id && std::filesystem::equivalent(other.path, out, ec)) {
                     MessageBoxW(window, L"目标 PDF 已在另一个文件会话中打开，请先关闭该文件或选择其他路径。",
@@ -1694,10 +2406,96 @@ struct App {
                     quitting = false;
                 return;
             }
+        // An accepted shell-open request must not disappear with the last window.
+        if (windows.size() == 1 && pendingOpenRequests) {
+            quitting = false;
+            return;
+        }
         DestroyWindow(window);
     }
     void fileMenu() {
         openPopup(PanelKind::Files);
+    }
+    void beginTitlePress(POINT screen) {
+        titleWasFilesOpen = panel && panelKind == PanelKind::Files;
+        closePanel();
+        stopInertia();
+        titlePressStart = screen;
+        titlePressed = true;
+        SetCapture(window);
+    }
+    void cancelTitlePress() {
+        if (!titlePressed)
+            return;
+        titlePressed = false;
+        if (GetCapture() == window)
+            ReleaseCapture();
+    }
+    bool moveTitlePress(POINT screen) {
+        if (!titlePressed || fullscreen)
+            return false;
+        if (std::abs(screen.x - titlePressStart.x) < GetSystemMetricsForDpi(SM_CXDRAG, GetDpiForWindow(window)) &&
+            std::abs(screen.y - titlePressStart.y) < GetSystemMetricsForDpi(SM_CYDRAG, GetDpiForWindow(window)))
+            return false;
+        cancelTitlePress();
+        return true;
+    }
+    bool endTitlePress(POINT screen) {
+        if (!titlePressed)
+            return false;
+        cancelTitlePress();
+        if (!titleWasFilesOpen && fileAreaContains(screen))
+            fileMenu();
+        return true;
+    }
+    void beginFileDrag(double x, double y, POINT screen, UINT pointer = 0) {
+        const int hit = menuHit(x, y);
+        if (panelKind != PanelKind::Files || hit < 0 || menuRows[size_t(hit)].command < 1000) {
+            panelInput(x, y);
+            return;
+        }
+        fileDragCommand = menuRows[size_t(hit)].command;
+        fileDragStart = screen;
+        fileDragMoved = false;
+        fileDragPointer = pointer;
+        if (!pointer)
+            SetCapture(panel);
+    }
+    bool moveFileDrag(POINT screen) {
+        if (!fileDragCommand)
+            return false;
+        if (std::abs(screen.x - fileDragStart.x) >= GetSystemMetricsForDpi(SM_CXDRAG, GetDpiForWindow(window)) ||
+            std::abs(screen.y - fileDragStart.y) >= GetSystemMetricsForDpi(SM_CYDRAG, GetDpiForWindow(window)))
+            fileDragMoved = true;
+        RECT box{};
+        GetWindowRect(panel, &box);
+        if (!fileDragMoved || PtInRect(&box, screen))
+            return true;
+        const int index = fileDragCommand - 1000;
+        const bool pointer = fileDragPointer != 0;
+        fileDragCommand = 0;
+        fileDragPointer = 0;
+        if (GetCapture() == panel)
+            ReleaseCapture();
+        if (auto *child = detachDocument(index, &screen); child && !smoke && !pointer)
+            // Let Windows move the new window; no polling timer or PDF work per mouse event.
+            SendMessageW(child->window, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(screen.x, screen.y));
+        return true;
+    }
+    bool endFileDrag(POINT screen) {
+        if (!fileDragCommand)
+            return false;
+        const int command = fileDragCommand;
+        const bool moved = fileDragMoved;
+        fileDragCommand = 0;
+        fileDragPointer = 0;
+        if (GetCapture() == panel)
+            ReleaseCapture();
+        ScreenToClient(panel, &screen);
+        const int hit = menuHit(screen.x / dpi(), screen.y / dpi());
+        if (!moved && hit >= 0 && menuRows[size_t(hit)].command == command)
+            runCommand(command);
+        return true;
     }
     void functionsMenu() {
         openPopup(PanelKind::Functions);
@@ -1722,6 +2520,25 @@ struct App {
             top += menuRowHeight(row);
         }
         return -1;
+    }
+    int mergeInsertionAt(double y) const {
+        double top = 16 - menuScroll;
+        for (const auto &row : menuRows) {
+            const double rowHeight = menuRowHeight(row);
+            if (row.command >= 1000 && y < top + rowHeight / 2)
+                return std::clamp(row.command - 1000, 0, int(sessions.size()));
+            top += rowHeight;
+        }
+        return int(sessions.size());
+    }
+    double mergeInsertionLineY() const {
+        double top = 16 - menuScroll;
+        for (const auto &row : menuRows) {
+            if (!row.heading && (row.command < 1000 || row.command - 1000 >= mergeInsert))
+                break;
+            top += menuRowHeight(row);
+        }
+        return std::clamp(top, 18.0, popupHeight() - 18);
     }
     void buildMenu() {
         menuRows.clear();
@@ -1752,7 +2569,9 @@ struct App {
             item(15, L"撤销\tCtrl+Z", ready && doc()->history.cursor > 0);
             item(16, L"重做\tCtrl+Y", ready && doc()->history.cursor + 1 < doc()->history.states.size());
             item(11, L"删除所选笔记\tDelete", ready && selected.has_value());
+            item(20, L"复制所选文字\tCtrl+C", ready && doc()->selectionPage >= 0);
             heading(L"阅读与显示");
+            item(19, L"在文档中查找\tCtrl+F", ready);
             item(4, L"适合宽度", ready);
             item(5, L"隐藏笔记", ready, ready && doc()->hidden);
             item(6, L"全屏\tF11", true, fullscreen);
@@ -1816,6 +2635,11 @@ struct App {
             }
             y += rowHeight;
         }
+        if (panelKind == PanelKind::Files && mergeSource && mergeInsert >= 0) {
+            const float insertionY = float(mergeInsertionLineY());
+            set({37, 117, 238, 255});
+            rt->DrawLine(D2D1::Point2F(30, insertionY), D2D1::Point2F(w - 30, insertionY), b, 2);
+        }
         rt->PopAxisAlignedClip();
         const double overflow = menuHeight() - (popupHeight() - 32);
         if (overflow > 0) {
@@ -1829,6 +2653,13 @@ struct App {
     void popupMenuScroll(double delta) {
         menuScroll = std::clamp(menuScroll + delta, 0.0, std::max(0.0, menuHeight() - (popupHeight() - 32)));
         menuHover = -1;
+        if (mergeSource && panel) {
+            POINT screen{};
+            if (GetCursorPos(&screen)) {
+                ScreenToClient(panel, &screen);
+                mergeInsert = mergeInsertionAt(screen.y / dpi());
+            }
+        }
         if (panel)
             InvalidateRect(panel, nullptr, FALSE);
     }
@@ -1922,6 +2753,12 @@ struct App {
             break;
         case 18:
             openDiagnosticDirectory();
+            break;
+        case 19:
+            openSearch();
+            break;
+        case 20:
+            copyText();
             break;
         }
     }
@@ -2047,6 +2884,8 @@ struct App {
             return;
         }
         const bool wasPanelOpen = panel != nullptr;
+        if (searchInput(x, y))
+            return;
         const auto previousPanel = panelKind;
         if (panel) {
             closePanel();
@@ -2099,6 +2938,8 @@ struct App {
                     undo(true);
                 if (button == 8)
                     save();
+                if (button == 9)
+                    openSearch();
                 return;
             }
             if (tool == button && button > 0) {
@@ -2135,11 +2976,13 @@ struct App {
             beginPan(x, y, false);
             return;
         }
-        if (s->hidden)
-            return;
         gesturePage = page;
         startPoint = pagePoint(x, y, page);
         int effective = barrel ? 3 : tool;
+        if (effective != 0)
+            s->selectionPage = -1;
+        if (s->hidden && effective != 0)
+            return;
         if (effective == 3) {
             ++eraseRevision;
             gesture = Gesture::Erase;
@@ -2149,14 +2992,25 @@ struct App {
             return;
         }
         if (effective == 0) {
+            s->selectionPage = -1;
             selected.reset();
-            for (auto i = s->history.current().rbegin(); i != s->history.current().rend(); ++i)
+            for (auto i = s->history.current().rbegin(); !s->hidden && i != s->history.current().rend(); ++i)
                 if (i->page == page && hit(*i, startPoint.x, startPoint.y, 5 / s->scale)) {
                     selected = i->id;
                     workingStroke = *i;
                     gesture = Gesture::Move;
                     break;
                 }
+            if (!selected && s->textCache.contains(page)) {
+                int character = s->textCache.at(page)->hit(startPoint, 2 / s->scale);
+                if (character >= 0) {
+                    s->selectionPage = page;
+                    s->selectionFirst = s->selectionLast = character;
+                    gesture = Gesture::Text;
+                }
+            }
+            if (!selected && gesture != Gesture::Text)
+                beginPan(x, y, false);
             invalidate();
             return;
         }
@@ -2201,6 +3055,15 @@ struct App {
         if (gesturePage < 0 || gesture == Gesture::None)
             return;
         auto p = pagePoint(x, y, gesturePage);
+        if (gesture == Gesture::Text) {
+            if (s->textCache.contains(gesturePage)) {
+                int character = s->textCache.at(gesturePage)->nearest(p);
+                if (character >= 0)
+                    s->selectionLast = character;
+            }
+            invalidate();
+            return;
+        }
         if (gesture == Gesture::Erase) {
             eraseAt(p);
             invalidate();
@@ -2259,7 +3122,7 @@ struct App {
         }
         gesture = Gesture::None;
         gesturePage = -1;
-        if (s && completed != Gesture::None && completed != Gesture::Pan && completed != Gesture::Toolbar)
+        if (s && (completed == Gesture::Draw || completed == Gesture::Move || completed == Gesture::Erase))
             recoverLater(*s);
         liveValid = false;
         invalidate();
@@ -2862,6 +3725,48 @@ struct App {
         }
         if (r->renderTicket && r->renderTicket != i->pendingTicket)
             return;
+        if (r->type == Result::Type::Text) {
+            if (r->textTicket != i->textTicket)
+                return;
+            const bool search = i->pendingSearch;
+            i->pendingText = -1;
+            if (r->text) {
+                if (!search || std::abs(r->textPage - i->page) <= 2)
+                    i->textCache[r->textPage] = std::move(r->text);
+                while (i->textCache.size() > 8) {
+                    auto victim = i->textCache.end();
+                    int farthest = -1;
+                    for (auto entry = i->textCache.begin(); entry != i->textCache.end(); ++entry) {
+                        if (entry->first == i->selectionPage || entry->first == r->textPage)
+                            continue;
+                        int distance = std::abs(entry->first - i->page);
+                        if (distance > farthest) { victim = entry; farthest = distance; }
+                    }
+                    if (victim == i->textCache.end())
+                        break;
+                    i->textCache.erase(victim);
+                }
+            } else
+                i->textErrors.insert(r->textPage);
+            if (search) {
+                if (!r->error.empty())
+                    ++i->searchSkipped;
+                const size_t available = 2000 - i->matches.size();
+                if (r->matches.size() > available)
+                    r->matches.resize(available);
+                i->matches.insert(i->matches.end(), std::make_move_iterator(r->matches.begin()),
+                                  std::make_move_iterator(r->matches.end()));
+                i->searchLimited = i->matches.size() >= 2000;
+                i->searchPage = r->textPage + 1;
+                if (&*i == doc() && searchVisible && i->searchIndex < 0 && !i->matches.empty())
+                    navigateSearch(1);
+            }
+            if (&*i == doc()) {
+                requestText();
+                invalidate();
+            }
+            return;
+        }
         if (r->type == Result::Type::Opened) {
             i->loading = false;
             i->pages = std::move(r->info.pages);
@@ -2967,6 +3872,11 @@ struct App {
         }
     }
     void closePanel() {
+        const bool saveSettings = panel && (panelKind == PanelKind::Tool || panelKind == PanelKind::Color);
+        mergeSource = nullptr;
+        mergeInsert = -1;
+        fileDragCommand = 0;
+        fileDragPointer = 0;
         if (panel) {
             auto closing = panel;
             panel = nullptr;
@@ -2985,7 +3895,8 @@ struct App {
             popupBitmap = nullptr;
             popupOldBitmap = nullptr;
         }
-        persistSettings();
+        if (saveSettings)
+            persistSettings();
         invalidate();
     }
     void chooseColor(int index) {
@@ -3412,12 +4323,24 @@ struct App {
             return MA_NOACTIVATE;
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN: {
+            if (m == WM_LBUTTONDOWN && a->panelKind == PanelKind::Files) {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                a->beginFileDrag(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi(), screen);
+                return 0;
+            }
             a->panelInput(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi(), m == WM_RBUTTONDOWN);
             if (a->popupDragging || a->colorDrag)
                 SetCapture(h);
             return 0;
         }
         case WM_MOUSEMOVE:
+            if (a->fileDragCommand) {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                a->moveFileDrag(screen);
+                return 0;
+            }
             if (a->panelKind == PanelKind::Functions || a->panelKind == PanelKind::Files) {
                 const int index = a->menuHit(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
                 if (index != a->menuHover) {
@@ -3430,6 +4353,12 @@ struct App {
                 a->movePanelSlider(GET_Y_LPARAM(l) / a->dpi());
             return 0;
         case WM_LBUTTONUP:
+            if (a->fileDragCommand) {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                a->endFileDrag(screen);
+                return 0;
+            }
             if (a->popupDragging)
                 a->movePanelSlider(GET_Y_LPARAM(l) / a->dpi());
             if (a->colorDrag)
@@ -3440,6 +4369,8 @@ struct App {
             a->persistSettings();
             return 0;
         case WM_CAPTURECHANGED:
+            a->fileDragCommand = 0;
+            a->fileDragPointer = 0;
             a->popupDragging = false;
             a->colorDrag = 0;
             return 0;
@@ -3478,7 +4409,18 @@ struct App {
                 const bool right = info.pointerType == PT_PEN &&
                                    GetPointerPenInfo(GET_POINTERID_WPARAM(w), &pen) &&
                                    (pen.penFlags & PEN_FLAG_BARREL) != 0;
+                if (!right && a->panelKind == PanelKind::Files) {
+                    a->beginFileDrag(p.x / a->dpi(), p.y / a->dpi(), info.ptPixelLocation,
+                                     GET_POINTERID_WPARAM(w));
+                    return 0;
+                }
                 a->panelInput(p.x / a->dpi(), p.y / a->dpi(), right);
+            } else if (a->fileDragCommand && a->fileDragPointer == GET_POINTERID_WPARAM(w)) {
+                if (m == WM_POINTERUP)
+                    a->endFileDrag(info.ptPixelLocation);
+                else if (info.pointerFlags & POINTER_FLAG_INCONTACT)
+                    a->moveFileDrag(info.ptPixelLocation);
+                return 0;
             } else if ((info.pointerFlags & POINTER_FLAG_INCONTACT) && a->panelKind == PanelKind::Color &&
                        a->colorDrag)
                 a->colorPointer(p.x / a->dpi(), p.y / a->dpi(), false);
@@ -3492,10 +4434,16 @@ struct App {
             return 0;
         }
         case WM_POINTERCAPTURECHANGED:
+            a->fileDragCommand = 0;
+            a->fileDragPointer = 0;
             a->popupDragging = false;
             a->colorDrag = 0;
             return 0;
         case WM_KEYDOWN:
+            if (w == 'F' && GetKeyState(VK_CONTROL) < 0) {
+                a->openSearch();
+                return 0;
+            }
             if (a->popupKey(w))
                 return 0;
             if (w == VK_ESCAPE) {
@@ -3506,17 +4454,22 @@ struct App {
         case WM_CLOSE:
             a->closePanel();
             return 0;
+        case WM_CANCELMODE:
+            a->closePanel();
+            return 0;
         }
         return DefWindowProcW(h, m, w, l);
     }
     void openPanel() {
         openPopup(PanelKind::Tool);
     }
-    void openPopup(PanelKind kind) {
+    void openPopup(PanelKind kind, HWND incoming = nullptr) {
         closePanel();
         if (kind == PanelKind::Tool && !configurableTool(tool))
             return;
         panelKind = kind;
+        mergeSource = incoming;
+        mergeInsert = incoming ? int(sessions.size()) : -1;
         if (kind == PanelKind::Functions || kind == PanelKind::Files)
             buildMenu();
         auto r = toolbar();
@@ -3535,9 +4488,13 @@ struct App {
             p.y = std::clamp(p.y, monitor.rcWork.top,
                              std::max(monitor.rcWork.top, monitor.rcWork.bottom - pixels.cy));
         }
-        panel =
-            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE, L"InkHornPanel", L"工具设置",
-                            WS_POPUP, p.x, p.y, pixels.cx, pixels.cy, window, nullptr, instance, this);
+        // An owned topmost popup can pull its owner in front of the window being dragged.
+        // The merge menu has an explicit lifetime in closePanel/clearMergeTarget instead.
+        const DWORD popupStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE |
+                                 (incoming ? WS_EX_TOPMOST : 0);
+        panel = CreateWindowExW(popupStyle, L"InkHornPanel", L"工具设置", WS_POPUP,
+                                p.x, p.y, pixels.cx, pixels.cy,
+                                incoming ? nullptr : window, nullptr, instance, this);
         if (!panel)
             return;
         popupDC = CreateCompatibleDC(nullptr);
@@ -3584,12 +4541,21 @@ struct App {
             ++a->fieldTextWrites;
         if (a->diagnostics.message(m, w, l, "edit"))
             a->invalidate();
+        if (m == WM_KEYDOWN && w == 'F' && GetKeyState(VK_CONTROL) < 0) {
+            a->openSearch();
+            return 0;
+        }
+        if (m == WM_KEYDOWN && h == a->searchEdit &&
+            a->searchKey(w, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0))
+            return 0;
+        if (m == WM_CHAR && (w == 6 || (h == a->searchEdit && (w == 1 || w == VK_RETURN || w == VK_ESCAPE))))
+            return 0;
         if (m == WM_LBUTTONDOWN || m == WM_POINTERDOWN || m == WM_SETFOCUS) {
             if (a->panel)
                 a->closePanel();
             a->stopInertia();
         }
-        if (m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) {
+        if (h != a->searchEdit && m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) {
             a->submitEdit(h, w == VK_RETURN);
             return 0;
         }
@@ -3604,6 +4570,7 @@ struct App {
             a = static_cast<App *>(reinterpret_cast<CREATESTRUCTW *>(l)->lpCreateParams);
             a->window = h;
             SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(a));
+            windows.push_back(a);
         }
         if (!a)
             return DefWindowProcW(h, m, w, l);
@@ -3612,6 +4579,48 @@ struct App {
         if (a->diagnostics.message(m, w, l))
             a->invalidate();
         switch (m) {
+        case WM_ENTERSIZEMOVE:
+            a->cancelTitlePress();
+            a->closePanel();
+            a->stopInertia();
+            GetWindowRect(h, &a->moveStart);
+            a->moveSize = {a->moveStart.right - a->moveStart.left, a->moveStart.bottom - a->moveStart.top};
+            a->windowMoving = true;
+            a->windowResizing = false;
+            a->moveCancelled = false;
+            a->dragProbeKnown = false;
+            if (!a->smoke)
+                // TIMERPROC also runs inside Windows' modal move loop and covers stationary hovering.
+                SetTimer(h, windowDragTimer, 32, windowDragTick);
+            return 0;
+        case WM_SIZING:
+            a->windowResizing = true;
+            KillTimer(h, windowDragTimer);
+            a->clearMergeTarget();
+            return TRUE;
+        case WM_MOVING: {
+            if (!a->windowResizing) {
+                POINT screen{};
+                GetCursorPos(&screen);
+                a->updateMergeTarget(screen);
+                auto *box = reinterpret_cast<RECT *>(l);
+                if (a->moveSize.cx && a->moveSize.cy) {
+                    const double scale = a->mergePreview ? .94 : 1.;
+                    box->right = box->left + LONG(a->moveSize.cx * scale);
+                    box->bottom = box->top + LONG(a->moveSize.cy * scale);
+                }
+            }
+            return TRUE;
+        }
+        case WM_EXITSIZEMOVE: {
+            POINT screen{};
+            GetCursorPos(&screen);
+            RECT box{};
+            GetWindowRect(h, &box);
+            const bool returnedToStart = EqualRect(&box, &a->moveStart) != FALSE;
+            a->endWindowMove(screen, a->moveCancelled || GetAsyncKeyState(VK_ESCAPE) < 0 || returnedToStart);
+            return 0;
+        }
         case WM_NCCALCSIZE:
             if (w) {
                 if (IsZoomed(h) && !a->fullscreen) {
@@ -3665,7 +4674,11 @@ struct App {
             a->zoomEdit = CreateWindowExW(
                 0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL, 0, 0, 72, 23, h,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(zoomId)), a->instance, nullptr);
-            for (HWND edit : {a->pageEdit, a->zoomEdit}) {
+            a->searchEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+                0, 0, 164, 24, h, reinterpret_cast<HMENU>(static_cast<INT_PTR>(searchId)), a->instance, nullptr);
+            SendMessageW(a->searchEdit, EM_SETLIMITTEXT, 256, 0);
+            SendMessageW(a->searchEdit, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"在文档中查找"));
+            for (HWND edit : {a->pageEdit, a->zoomEdit, a->searchEdit}) {
                 SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(a->font), TRUE);
                 SetWindowSubclass(edit, editProc, 1, reinterpret_cast<DWORD_PTR>(a));
             }
@@ -3677,27 +4690,40 @@ struct App {
                 SendMessageW(a->tooltips, TTM_SETMAXTIPWIDTH, 0, 300);
             if (!a->smoke) {
                 try {
-                    a->storage = std::make_unique<Storage>();
+                    if (!sharedStorage)
+                        sharedStorage = std::make_shared<Storage>();
+                    a->storage = sharedStorage;
                     a->loadSettings();
                     a->recent = a->storage->readRecent();
                 } catch (...) {
                     a->notice = L"无法写入 EXE 旁的 InkHorn-data 文件夹，请检查目录权限并及时保存 PDF。";
                 }
                 try {
-                    a->runtimeMonitor = std::make_unique<RuntimeMonitor>(a->diagnosticDirectory());
+                    if (!sharedMonitor)
+                        sharedMonitor = std::make_shared<RuntimeMonitor>(a->diagnosticDirectory());
+                    a->runtimeMonitor = sharedMonitor;
                 } catch (...) {
                     a->showToast(L"无法创建运行诊断日志，请检查 InkHorn-data 目录权限", true);
                 }
             }
-            a->engine = std::make_unique<PdfEngine>([h](std::shared_ptr<Result> r) {
+            if (!sharedEngine)
+              sharedEngine = std::make_shared<PdfEngine>([](std::shared_ptr<Result> r) {
                 auto *p = new std::shared_ptr<Result>(std::move(r));
-                if (!PostMessageW(h, resultMessage, 0, reinterpret_cast<LPARAM>(p)))
+                if (!PostMessageW(broker, resultMessage, 0, reinterpret_cast<LPARAM>(p)))
                     delete p;
             });
+            a->engine = sharedEngine;
             SetTimer(h, 1, 150, nullptr);
             return 0;
         }
         case WM_SIZE:
+            if (a->windowMoving && !a->windowResizing) {
+                // Temporary attraction feedback does not change fit/zoom or queue PDF renders.
+                if (a->target)
+                    a->target->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+                a->invalidate();
+                return 0;
+            }
             a->stopInertia();
             a->inkBrush.Reset();
             a->inkTarget.Reset();
@@ -3732,7 +4758,8 @@ struct App {
             return 1;
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC:
-            if (reinterpret_cast<HWND>(l) == a->pageEdit || reinterpret_cast<HWND>(l) == a->zoomEdit) {
+            if (reinterpret_cast<HWND>(l) == a->pageEdit || reinterpret_cast<HWND>(l) == a->zoomEdit ||
+                reinterpret_cast<HWND>(l) == a->searchEdit) {
                 auto dc = reinterpret_cast<HDC>(w);
                 SetBkColor(dc, RGB(244, 246, 250));
                 SetTextColor(dc, RGB(67, 78, 98));
@@ -3745,7 +4772,8 @@ struct App {
                     a->refreshCursor();
                     return TRUE;
                 }
-                if (reinterpret_cast<HWND>(w) == a->pageEdit || reinterpret_cast<HWND>(w) == a->zoomEdit) {
+                if (reinterpret_cast<HWND>(w) == a->pageEdit || reinterpret_cast<HWND>(w) == a->zoomEdit ||
+                    reinterpret_cast<HWND>(w) == a->searchEdit) {
                     if (!a->smoke)
                         SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
                     return TRUE;
@@ -3766,6 +4794,14 @@ struct App {
             a->refreshCursor();
             return 0;
         case WM_TIMER:
+            if (w == 4 || w == windowDragTimer) {
+                windowDragTick(h, m, w, 0);
+                return 0;
+            }
+            if (w == 3) {
+                a->restartSearch();
+                return 0;
+            }
             if (w == 2) {
                 a->animateScroll();
                 return 0;
@@ -3803,6 +4839,14 @@ struct App {
             a->penNear = a->penTemporaryEraser = false;
             if (a->gesture != Gesture::None)
                 a->finishGesture();
+            {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                if (!a->closePrompt && a->fileAreaContains(screen)) {
+                    a->beginTitlePress(screen);
+                    return 0;
+                }
+            }
             a->down(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
             a->mouseContact = a->gesture != Gesture::None;
             if (a->mouseContact)
@@ -3811,6 +4855,13 @@ struct App {
                 a->presentInkIfDue();
             return 0;
         case WM_MOUSEMOVE:
+            if (a->titlePressed) {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                if (a->moveTitlePress(screen) && !a->smoke)
+                    SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(screen.x, screen.y));
+                return 0;
+            }
             if (a->penContact.active()) {
                 a->refreshCursor();
                 return 0;
@@ -3840,6 +4891,12 @@ struct App {
             a->invalidate();
             return 0;
         case WM_LBUTTONUP:
+            if (a->titlePressed) {
+                POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &screen);
+                a->endTitlePress(screen);
+                return 0;
+            }
             if (!a->mouseContact)
                 return 0;
             a->releaseAt(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
@@ -3932,21 +4989,54 @@ struct App {
             a->activePointer = 0;
             return 0;
         case WM_CAPTURECHANGED:
+            a->titlePressed = false;
             if (a->mouseContact && a->gesture != Gesture::None)
                 a->cancelGesture();
             return 0;
         case WM_CANCELMODE:
+            a->moveCancelled = true;
+            KillTimer(h, windowDragTimer);
+            a->cancelTitlePress();
+            a->clearMergeTarget();
             a->cancelGesture();
             a->activePointer = 0;
             return 0;
         case WM_ACTIVATEAPP:
             if (!w) {
+                a->moveCancelled = true;
+                KillTimer(h, windowDragTimer);
+                a->cancelTitlePress();
+                a->clearMergeTarget();
                 a->penNear = a->penTemporaryEraser = false;
                 a->closePanel();
                 a->cancelGesture();
             }
             return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(w) != WA_INACTIVE)
+                lastActive = a;
+            break;
+        case WM_COMMAND:
+            if (LOWORD(w) == searchId && HIWORD(w) == EN_CHANGE && a->searchVisible) {
+                // Invalidate the old query immediately; debounce the new scan.
+                if (auto *s = a->doc()) {
+                    a->engine->cancelText(s->id);
+                    s->textTicket = a->nextTextTicket++;
+                    s->pendingText = -1;
+                    s->query.clear();
+                    s->matches.clear();
+                    s->searchIndex = -1;
+                }
+                SetTimer(h, 3, 180, nullptr);
+                a->invalidate();
+                return 0;
+            }
+            break;
         case WM_KEYDOWN: {
+            if (w == VK_ESCAPE && a->titlePressed) {
+                a->cancelTitlePress();
+                return 0;
+            }
             if (a->closePrompt) {
                 if (w == VK_ESCAPE)
                     a->answerClosePrompt(0);
@@ -3976,16 +5066,28 @@ struct App {
             }
             if (w == VK_ESCAPE) {
                 a->stopInertia();
-                if (a->panel)
+                if (a->searchVisible)
+                    a->closeSearch();
+                else if (a->panel)
                     a->closePanel();
                 else if (a->gesture != Gesture::None)
                     a->cancelGesture();
+                else if (auto *s = a->doc(); s && s->selectionPage >= 0) {
+                    s->selectionPage = -1;
+                    a->invalidate();
+                }
                 else if (a->fullscreen)
                     a->toggleFullscreen();
                 return 0;
             }
             if (ctrl) {
                 switch (w) {
+                case 'F':
+                    a->openSearch();
+                    return 0;
+                case 'C':
+                    a->copyText();
+                    return 0;
                 case 'O':
                     a->open(a->dialog(false));
                     return 0;
@@ -4011,6 +5113,10 @@ struct App {
                     SendMessageW(a->pageEdit, EM_SETSEL, 0, -1);
                     return 0;
                 }
+            }
+            if (w == VK_F3 && a->searchVisible) {
+                a->navigateSearch(shift ? -1 : 1);
+                return 0;
             }
             if (w == VK_DELETE) {
                 a->deleteSelected();
@@ -4061,6 +5167,14 @@ struct App {
             break;
         case WM_DESTROY: {
             RuntimeStage stage(RuntimeThread::Ui, "ui.shutdown");
+            a->clearMergeTarget();
+            KillTimer(h, windowDragTimer);
+            a->cancelTitlePress();
+            for (auto *other : windows)
+                if (other != a && other->mergeTarget == h)
+                    other->clearMergeTarget();
+                else if (other != a && other->mergeSource == h)
+                    other->closePanel();
             a->diagnostics.stop();
             KillTimer(h, 1);
             a->stopInertia();
@@ -4068,6 +5182,15 @@ struct App {
             a->persistSettings();
             a->engine.reset();
             a->storage.reset();
+            a->runtimeMonitor.reset();
+            std::erase(windows, a);
+            if (lastActive == a)
+                lastActive = windows.empty() ? nullptr : windows.front();
+            if (windows.empty()) {
+                sharedEngine.reset();
+                sharedStorage.reset();
+                sharedMonitor.reset();
+            }
             {
                 MSG pending{};
                 while (PeekMessageW(&pending, h, resultMessage, resultMessage, PM_REMOVE))
@@ -4077,25 +5200,86 @@ struct App {
                 DeleteObject(a->font);
             if (a->fieldBackground)
                 DeleteObject(a->fieldBackground);
-            PostQuitMessage(0);
+            if (windows.empty())
+                PostQuitMessage(0);
             return 0;
         }
+        case WM_NCDESTROY:
+            std::erase(windows, a);
+            a->window = nullptr;
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            PostMessageW(broker, cleanupWindowsMessage, 0, 0);
+            break;
         }
         return DefWindowProcW(h, m, w, l);
     }
 };
 int run(HINSTANCE instance, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int argumentCount{};
+    auto arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    std::vector<std::wstring> startupArguments;
+    for (int i = 1; arguments && i < argumentCount; ++i)
+        startupArguments.emplace_back(arguments[i]);
+    if (arguments)
+        LocalFree(arguments);
+    const auto hasFlag = [&](const wchar_t *flag) {
+        return std::find(startupArguments.begin(), startupArguments.end(), flag) != startupArguments.end();
+    };
+    const bool testMode = hasFlag(L"--smoke-test") || hasFlag(L"--performance-test") ||
+        hasFlag(L"--profile-scroll") || hasFlag(L"--ink-quality-test") || hasFlag(L"--short-stroke-test");
+    wchar_t executable[32768]{};
+    GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable)));
+    std::wstring brokerName = instanceKey(executable);
+    std::optional<InstanceLock> instanceLock;
+    if (testMode)
+        brokerName += L"-test-" + std::to_wstring(GetCurrentProcessId());
+    else {
+        instanceLock.emplace(brokerName);
+        if (!instanceLock->valid()) {
+            MessageBoxW(nullptr, L"无法初始化窗口会话。", L"InkHorn", MB_OK | MB_ICONERROR);
+            return 8;
+        }
+        if (!instanceLock->primary()) {
+            int count{};
+            auto args = CommandLineToArgvW(GetCommandLineW(), &count);
+            std::vector<std::filesystem::path> paths;
+            for (int i = 1; args && i < count; ++i)
+                paths.emplace_back(std::filesystem::absolute(args[i]));
+            if (args)
+                LocalFree(args);
+            const auto deadline = GetTickCount64() + 5000;
+            while (GetTickCount64() < deadline) {
+                if (auto receiver = FindWindowExW(HWND_MESSAGE, nullptr, brokerClass, brokerName.c_str())) {
+                    if (forwardOpen(receiver, paths))
+                        return 0;
+                    break;
+                }
+                if (instanceLock->recover())
+                    break;
+                Sleep(20);
+            }
+            if (!instanceLock->primary()) {
+                MessageBoxW(nullptr, L"现有 InkHorn 窗口暂时无法接收文件，请等待当前操作完成后重试。",
+                            L"InkHorn", MB_OK | MB_ICONINFORMATION);
+                return 8;
+            }
+        }
+    }
     HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    struct ComLifetime {
+        bool initialized{};
+        ~ComLifetime() { if (initialized) CoUninitialize(); }
+    } comLifetime{SUCCEEDED(com)};
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
     InitCommonControlsEx(&controls);
     App a;
     a.instance = instance;
-    const bool performance = wcsstr(GetCommandLineW(), L"--performance-test") != nullptr;
-    const bool profile = wcsstr(GetCommandLineW(), L"--profile-scroll") != nullptr;
-    const bool quality = wcsstr(GetCommandLineW(), L"--ink-quality-test") != nullptr;
-    const bool shortStrokes = wcsstr(GetCommandLineW(), L"--short-stroke-test") != nullptr;
-    a.smoke = shortStrokes || quality || profile || performance || wcsstr(GetCommandLineW(), L"--smoke-test") != nullptr;
+    const bool performance = hasFlag(L"--performance-test");
+    const bool profile = hasFlag(L"--profile-scroll");
+    const bool quality = hasFlag(L"--ink-quality-test");
+    const bool shortStrokes = hasFlag(L"--short-stroke-test");
+    a.smoke = testMode;
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, a.factory.GetAddressOf())) ||
         FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                    reinterpret_cast<IUnknown **>(a.textFactory.GetAddressOf())))) {
@@ -4141,6 +5325,30 @@ int run(HINSTANCE instance, int show) {
     wc.lpszClassName = L"InkHornPanel";
     wc.hIcon = nullptr;
     RegisterClassExW(&wc);
+    wc.lpfnWndProc = App::brokerProc;
+    wc.lpszClassName = brokerClass;
+    RegisterClassExW(&wc);
+    App::broker = CreateWindowExW(0, brokerClass, brokerName.c_str(), 0, 0, 0, 0, 0,
+                                   HWND_MESSAGE, nullptr, instance, nullptr);
+    if (!App::broker)
+        return 2;
+    struct BrokerLifetime {
+        ~BrokerLifetime() {
+            App::sharedEngine.reset();
+            MSG pending{};
+            while (PeekMessageW(&pending, App::broker, 0, 0, PM_REMOVE)) {
+                if (pending.message == resultMessage)
+                    delete reinterpret_cast<std::shared_ptr<Result> *>(pending.lParam);
+                else if (pending.message == openDocumentsMessage)
+                    delete reinterpret_cast<std::vector<std::filesystem::path> *>(pending.lParam);
+            }
+            App::detached.clear();
+            App::deferredOpens.clear();
+            App::pendingOpenRequests = 0;
+            DestroyWindow(App::broker);
+            App::broker = nullptr;
+        }
+    } brokerLifetime;
     auto h = CreateWindowExW(0, L"InkHornWindow", L"InkHorn", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, 1160, 860, nullptr, nullptr, instance, &a);
     if (!h)
@@ -4155,15 +5363,11 @@ int run(HINSTANCE instance, int show) {
     if (shortStrokes) {
         const bool ok = a.shortStrokeCheck();
         DestroyWindow(h);
-        if (SUCCEEDED(com))
-            CoUninitialize();
         return ok ? 0 : 7;
     }
     if (quality) {
         const bool ok = a.inkQualityCheck();
         DestroyWindow(h);
-        if (SUCCEEDED(com))
-            CoUninitialize();
         return ok ? 0 : 6;
     }
     if (profile) {
@@ -4176,18 +5380,15 @@ int run(HINSTANCE instance, int show) {
         if (args)
             LocalFree(args);
         DestroyWindow(h);
-        if (SUCCEEDED(com))
-            CoUninitialize();
         return ok ? 0 : 5;
     }
     if (performance) {
         const bool ok = a.performanceCheck();
         DestroyWindow(h);
-        if (SUCCEEDED(com))
-            CoUninitialize();
         return ok ? 0 : 4;
     }
     if (a.smoke) {
+        std::ofstream smokeReport("native-ui-smoke-results.txt");
         a.paint();
         const auto emptyButton = a.homeOpenButton();
         bool homeOk = a.tool == 0 && emptyButton.right < a.homeRight().left &&
@@ -4538,6 +5739,76 @@ int run(HINSTANCE instance, int show) {
             a.paint();
         }
         a.closePanel();
+        // Search UI and pointer selection must stay outside ink history/recovery.
+        smokeReport << "before-search: " << ok << '\n';
+        a.tool = 0;
+        a.doc()->scroll = 0;
+        a.doc()->horizontal = 0;
+        a.doc()->page = 0;
+        auto textPage = std::make_shared<PageText>();
+        textPage->page = 0;
+        const std::u32string smokeText = U"Hello world";
+        for (size_t i = 0; i < smokeText.size(); ++i) {
+            const double left = 100 + i * 8.0;
+            textPage->characters.push_back({smokeText[i], {left, 100, left + 7, 112}, smokeText[i] != U' '});
+        }
+        a.doc()->textCache[0] = textPage;
+        const auto historyBeforeText = a.doc()->history.fingerprint();
+        const double tx = a.pageLeft(0), ty = a.header() + a.topOf(0);
+        a.down(tx + 102 * a.doc()->scale, ty + 106 * a.doc()->scale);
+        ok = ok && a.gesture == App::Gesture::Text && !a.selected;
+        a.move(tx + 184 * a.doc()->scale, ty + 106 * a.doc()->scale);
+        a.finishGesture();
+        ok = ok && selectedText(*textPage, a.doc()->selectionFirst, a.doc()->selectionLast) == L"Hello world" &&
+             a.doc()->history.fingerprint() == historyBeforeText;
+        const auto searchToolbar = a.toolbar();
+        const double searchToolY = searchToolbar.top + a.toolsTop() + 9 * 46 + 12 - a.panelScroll + 21;
+        ok = ok && a.toolHit((searchToolbar.left + searchToolbar.right) / 2, searchToolY) == 9 && a.toolbarGlyph(9) == 14;
+        a.down((searchToolbar.left + searchToolbar.right) / 2, searchToolY);
+        ok = ok && a.searchVisible && a.tool == 0;
+        smokeReport << "toolbar-search: " << ok << " hit=" << a.toolHit((searchToolbar.left + searchToolbar.right) / 2, searchToolY)
+                    << " visible=" << a.searchVisible << '\n';
+        SetWindowTextW(a.searchEdit, L"world");
+        a.searchKey('A', true, false);
+        DWORD selectionStart{}, selectionEnd{};
+        SendMessageW(a.searchEdit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+        ok = ok && selectionStart == 0 && selectionEnd == 5;
+        RECT searchFieldPixels{};
+        GetWindowRect(a.searchEdit, &searchFieldPixels);
+        MapWindowPoints(nullptr, h, reinterpret_cast<POINT *>(&searchFieldPixels), 2);
+        const auto searchArrow = a.searchButton(0);
+        ok = ok && std::abs((searchFieldPixels.top + searchFieldPixels.bottom) / 2.0 -
+                            (searchArrow.top + searchArrow.bottom) / 2.0 * a.dpi()) <= 1.5 &&
+             a.searchButton(0).left - a.searchField().right <= 8 &&
+             a.searchField().right - a.searchCountBox().right == 10 &&
+             a.searchCountBox().right - a.searchCountBox().left == 66 &&
+             a.searchCountBox().left * a.dpi() - searchFieldPixels.right >= 5 * a.dpi();
+        smokeReport << "search-layout: " << ok << " selection=" << selectionStart << ',' << selectionEnd
+                    << " edit-center=" << (searchFieldPixels.top + searchFieldPixels.bottom) / 2.0
+                    << " arrow-center=" << (searchArrow.top + searchArrow.bottom) / 2.0 * a.dpi() << '\n';
+        a.restartSearch();
+        ok = ok && a.searchVisible && a.doc()->query == L"world";
+        a.doc()->pendingSearch = true;
+        a.doc()->textTicket = 888;
+        auto searchResult = std::make_shared<Result>();
+        searchResult->type = Result::Type::Text;
+        searchResult->document = a.doc()->id;
+        searchResult->textTicket = 888;
+        searchResult->textPage = 0;
+        searchResult->text = textPage;
+        searchResult->matches = findText(*textPage, L"world");
+        a.result(searchResult);
+        ok = ok && a.doc()->matches.size() == 1 && a.doc()->searchIndex == 0;
+        a.paint();
+        SetWindowTextW(a.searchEdit, L"Hello");
+        a.restartSearch();
+        a.result(searchResult); // Old query's callback must not restore its highlights.
+        ok = ok && a.doc()->matches.empty() && a.doc()->query == L"Hello";
+        SendMessageW(a.searchEdit, WM_KEYDOWN, VK_ESCAPE, 0);
+        ok = ok && !a.searchVisible && a.doc()->query.empty();
+        a.doc()->textCache.clear();
+        a.doc()->selectionPage = -1;
+        a.doc()->scroll = 0;
         SetWindowTextW(a.pageEdit, L"2");
         a.submitEdit(a.pageEdit, true);
         ok = ok && a.doc()->page == 1;
@@ -4553,9 +5824,439 @@ int run(HINSTANCE instance, int show) {
         ok = ok && a.sessions.empty();
         a.sessions.clear();
         a.active = -1;
-        DestroyWindow(h);
-        if (SUCCEEDED(com))
-            CoUninitialize();
+        smokeReport << "before-split: " << ok << '\n';
+        Session transfer;
+        transfer.id = a.nextDocument++;
+        transfer.path = std::filesystem::absolute(L"split-window-test.pdf");
+        transfer.pages = {{595, 842}, {595, 842}};
+        transfer.loading = false;
+        transfer.fit = false;
+        transfer.scale = .75;
+        transfer.scroll = 120;
+        transfer.history.reset({});
+        transfer.history.commit({{++a.nextStroke, 0, Kind::Ink, {0, 0, 0, 255}, 2,
+                                  {{10, 10, 2}, {20, 20, 2}}}});
+        const auto transferId = transfer.id;
+        const auto transferPath = transfer.path;
+        const auto transferHistory = transfer.history.fingerprint();
+        a.sessions.push_back(std::move(transfer));
+        a.active = 0;
+        a.layout();
+        RECT originalBounds{};
+        GetWindowRect(h, &originalBounds);
+        // The real client message path distinguishes a title click from a window drag.
+        const LPARAM titlePoint = MAKELPARAM(int((a.fileLeft() + 60) * a.dpi()), int(20 * a.dpi()));
+        SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, titlePoint);
+        ok = ok && a.titlePressed && !a.panel;
+        SendMessageW(h, WM_LBUTTONUP, 0, titlePoint);
+        ok = ok && !a.titlePressed && a.panel && a.panelKind == App::PanelKind::Files &&
+             GetWindow(a.panel, GW_OWNER) == h && a.mergeInsert == -1;
+        SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, titlePoint);
+        SendMessageW(h, WM_LBUTTONUP, 0, titlePoint);
+        ok = ok && !a.panel; // A second click closes the same list.
+        SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, titlePoint);
+        SendMessageW(h, WM_MOUSEMOVE, MK_LBUTTON, titlePoint);
+        ok = ok && a.titlePressed && !a.panel;
+        SendMessageW(h, WM_MOUSEMOVE, MK_LBUTTON,
+                     MAKELPARAM(int((a.fileLeft() + 90) * a.dpi()), int(28 * a.dpi())));
+        ok = ok && !a.titlePressed && !a.panel && GetCapture() != h;
+        SendMessageW(h, WM_LBUTTONUP, 0, titlePoint);
+        ok = ok && !a.panel;
+        SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, titlePoint);
+        SendMessageW(h, WM_KEYDOWN, VK_ESCAPE, 0);
+        SendMessageW(h, WM_LBUTTONUP, 0, titlePoint);
+        ok = ok && !a.titlePressed && !a.panel;
+        smokeReport << "file-title-click-and-drag: " << ok << '\n';
+        // A click (including the former split-button position) only activates the file.
+        a.fileMenu();
+        const LPARAM filePoint = MAKELPARAM(int((a.popupWidth() - 54) * a.dpi()), int(73 * a.dpi()));
+        SendMessageW(a.panel, WM_LBUTTONDOWN, MK_LBUTTON, filePoint);
+        SendMessageW(a.panel, WM_LBUTTONUP, 0, filePoint);
+        ok = ok && a.sessions.size() == 1 && App::detached.empty();
+        a.fileMenu();
+        auto popup = a.panel;
+        SendMessageW(popup, WM_LBUTTONDOWN, MK_LBUTTON, filePoint);
+        SendMessageW(popup, WM_MOUSEMOVE, MK_LBUTTON, filePoint); // Below the drag threshold.
+        ok = ok && a.sessions.size() == 1 && a.fileDragCommand == 1000;
+        POINT dragOut{int((a.popupWidth() + 40) * a.dpi()), int(73 * a.dpi())};
+        ClientToScreen(popup, &dragOut);
+        SendMessageW(popup, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(int((a.popupWidth() + 40) * a.dpi()), int(73 * a.dpi())));
+        auto *split = App::detached.empty() ? nullptr : App::detached.back().get();
+        smokeReport << "split-created: " << bool(split) << " original-documents=" << a.sessions.size() << '\n';
+        ok = ok && split && a.sessions.empty() && split->engine == a.engine &&
+             split->doc()->id == transferId && split->doc()->history.dirty() &&
+             split->doc()->history.cursor == 1 && split->doc()->history.fingerprint() == transferHistory &&
+             split->doc()->scale == .75 && split->doc()->scroll == 120;
+        if (split)
+            smokeReport << "split-state: " << ok << " scale=" << split->doc()->scale
+                        << " scroll=" << split->doc()->scroll << " cursor=" << split->doc()->history.cursor << '\n';
+        if (split) {
+            RECT splitBounds{};
+            GetWindowRect(split->window, &splitBounds);
+            ok = ok && splitBounds.right - splitBounds.left == originalBounds.right - originalBounds.left &&
+                 splitBounds.bottom - splitBounds.top == originalBounds.bottom - originalBounds.top;
+            ok = ok && dragOut.x - splitBounds.left == (splitBounds.right - splitBounds.left) / 4 &&
+                 dragOut.y - splitBounds.top == LONG(split->header() * split->dpi() / 2);
+            smokeReport << "split-pointer-anchor: " << ok << '\n';
+            a.open(transferPath);
+            ok = ok && a.sessions.empty() && split->sessions.size() == 1 && App::lastActive == split;
+            smokeReport << "reopen-split: " << ok << '\n';
+            auto routed = std::make_shared<Result>();
+            routed->type = Result::Type::Text;
+            routed->document = transferId;
+            routed->textPage = 0;
+            routed->textTicket = split->doc()->textTicket = a.nextTextTicket++;
+            routed->text = textPage;
+            App::brokerProc(App::broker, resultMessage, 0,
+                            reinterpret_cast<LPARAM>(new std::shared_ptr<Result>(routed)));
+            ok = ok && split->doc()->textCache.contains(0);
+            smokeReport << "routed-result: " << ok << '\n';
+            split->undo(false);
+            ok = ok && split->doc()->history.current().empty();
+            split->undo(true);
+            ok = ok && split->doc()->history.fingerprint() == transferHistory;
+            smokeReport << "split-undo: " << ok << '\n';
+
+            // Exercise discovery on every attached display, using real signed desktop coordinates.
+            std::vector<HMONITOR> monitors;
+            EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+                reinterpret_cast<std::vector<HMONITOR> *>(data)->push_back(monitor);
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&monitors));
+            for (size_t display = 0; display < monitors.size(); ++display) {
+                MONITORINFO info{sizeof(MONITORINFO)};
+                GetMonitorInfoW(monitors[display], &info);
+                SetWindowPos(h, HWND_TOP, info.rcWork.left + 24, info.rcWork.top + 24,
+                             0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                SetWindowPos(split->window, HWND_TOP, info.rcWork.left + 24, info.rcWork.top + 24,
+                             0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                POINT displayTitle{int((a.fileLeft() + 70) * a.dpi()), int(20 * a.dpi())};
+                ClientToScreen(h, &displayTitle);
+                const bool discovered = split->findMergeTargetAt(displayTitle) == &a;
+                smokeReport << "display=" << display << " origin=" << info.rcWork.left << ',' << info.rcWork.top
+                            << " dpi=" << GetDpiForWindow(h) << " title=" << displayTitle.x << ',' << displayTitle.y
+                            << " discovered=" << discovered << '\n';
+                if (!discovered) {
+                    for (HWND other = GetTopWindow(nullptr); other; other = GetWindow(other, GW_HWNDNEXT)) {
+                        RECT box{};
+                        GetWindowRect(other, &box);
+                        if (other == split->window || !IsWindowVisible(other) || !PtInRect(&box, displayTitle))
+                            continue;
+                        char name[128]{};
+                        GetClassNameA(other, name, int(std::size(name)));
+                        smokeReport << "  covering-class=" << name << " bounds=" << box.left << ',' << box.top
+                                    << ',' << box.right << ',' << box.bottom << '\n';
+                        if (other == h)
+                            break;
+                    }
+                }
+                ok = discovered && ok;
+                SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+                const ULONGLONG hoverTime = 1000 + display * 2000;
+                split->updateMergeTarget(displayTitle, hoverTime);
+                split->updateMergeTarget(displayTitle, hoverTime + 300);
+                const bool expanded = a.panel && a.mergeSource == split->window && split->mergePreview;
+                ok = expanded && ok;
+                if (expanded) {
+                    POINT displayDrop{int(100 * a.dpi()), int(73 * a.dpi())};
+                    ClientToScreen(a.panel, &displayDrop);
+                    const HWND oldSource = split->window;
+                    split->endWindowMove(displayDrop, false);
+                    MSG request{};
+                    const bool queued = PeekMessageW(&request, App::broker, mergeWindowsMessage,
+                                                     mergeWindowsMessage, PM_REMOVE);
+                    if (queued)
+                        DispatchMessageW(&request);
+                    ok = ok && queued && !IsWindow(oldSource) && a.sessions.size() == 1 &&
+                         a.doc()->id == transferId && a.doc()->history.fingerprint() == transferHistory;
+                    if (queued && !IsWindow(oldSource))
+                        if (auto *newSource = a.detachDocument(a.active))
+                            split = newSource;
+                } else
+                    split->endWindowMove(displayTitle, true);
+                smokeReport << "display=" << display << " expand-and-merge=" << (expanded && ok) << '\n';
+            }
+            SetWindowPos(h, nullptr, originalBounds.left, originalBounds.top,
+                         originalBounds.right - originalBounds.left, originalBounds.bottom - originalBounds.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(split->window, nullptr, splitBounds.left, splitBounds.top,
+                         splitBounds.right - splitBounds.left, splitBounds.bottom - splitBounds.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(h, SW_HIDE);
+            ShowWindow(split->window, SW_HIDE);
+
+            // Discover the destination through the actual visible z-order, with the source covering it.
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            SetWindowPos(split->window, HWND_TOP, originalBounds.left, originalBounds.top, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            POINT visibleTitle{int((a.fileLeft() + 70) * a.dpi()), int(20 * a.dpi())};
+            ClientToScreen(h, &visibleTitle);
+            ok = ok && split->findMergeTargetAt(visibleTitle) == &a;
+            HWND overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, L"STATIC", L"", WS_POPUP | WS_VISIBLE,
+                                          visibleTitle.x - 4, visibleTitle.y - 4, 24, 24,
+                                          nullptr, nullptr, instance, nullptr);
+            ok = ok && overlay && split->findMergeTargetAt(visibleTitle) == nullptr;
+            HRGN narrowRegion = CreateRectRgn(0, 0, 24, 2);
+            const bool narrowSet = SetWindowRgn(overlay, narrowRegion, FALSE) != 0;
+            if (!narrowSet)
+                DeleteObject(narrowRegion);
+            ok = ok && narrowSet && split->findMergeTargetAt(visibleTitle) == &a;
+            HRGN cutoutRegion = CreateRectRgn(0, 0, 24, 24);
+            HRGN hole = CreateRectRgn(2, 2, 10, 10);
+            const bool complexRegion = CombineRgn(cutoutRegion, cutoutRegion, hole, RGN_DIFF) == COMPLEXREGION;
+            DeleteObject(hole);
+            const bool cutoutSet = SetWindowRgn(overlay, cutoutRegion, FALSE) != 0;
+            if (!cutoutSet)
+                DeleteObject(cutoutRegion);
+            ok = ok && complexRegion && cutoutSet && split->findMergeTargetAt(visibleTitle) == &a;
+            SetWindowRgn(overlay, nullptr, FALSE);
+            ok = ok && split->findMergeTargetAt(visibleTitle) == nullptr;
+            SetWindowLongPtrW(overlay, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+            ok = ok && split->findMergeTargetAt(visibleTitle) == &a;
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            split->updateMergeTarget(visibleTitle, 1000);
+            ok = ok && split->mergeTarget == h && split->mergePreview && a.mergeSource == split->window;
+            const HWND foregroundBeforeMenu = GetForegroundWindow();
+            split->updateMergeTarget(visibleTitle, 1300);
+            const HWND mergePanel = a.panel;
+            ShowWindow(mergePanel, SW_SHOWNOACTIVATE);
+            const auto above = [](HWND upper, HWND lower) {
+                for (HWND next = GetWindow(upper, GW_HWNDNEXT); next; next = GetWindow(next, GW_HWNDNEXT))
+                    if (next == lower)
+                        return true;
+                return false;
+            };
+            ok = ok && mergePanel && !GetWindow(mergePanel, GW_OWNER) &&
+                 (GetWindowLongPtrW(mergePanel, GWL_EXSTYLE) & WS_EX_TOPMOST) &&
+                 !(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) &&
+                 !(GetWindowLongPtrW(split->window, GWL_EXSTYLE) & WS_EX_TOPMOST) &&
+                 above(mergePanel, split->window) && above(split->window, h) &&
+                 GetForegroundWindow() == foregroundBeforeMenu;
+            a.paintPanel();
+            bool blueLine = false;
+            const int lineX = int(a.popupWidth() * a.dpi() / 2);
+            const int lineY = int(a.mergeInsertionLineY() * a.dpi());
+            for (int dy = -2; dy <= 2; ++dy) {
+                const COLORREF pixel = GetPixel(a.popupDC, lineX, lineY + dy);
+                blueLine = blueLine || (pixel != CLR_INVALID && GetBValue(pixel) > 180 &&
+                                       int(GetBValue(pixel)) - GetRValue(pixel) > 120 &&
+                                       int(GetBValue(pixel)) - GetGValue(pixel) > 70);
+            }
+            ok = ok && a.mergeInsert == 0 && blueLine;
+            smokeReport << "merge-menu-z-order-and-blue-line: " << ok << '\n';
+            split->endWindowMove(visibleTitle, true);
+            ok = ok && !IsWindow(mergePanel) && a.mergeInsert == -1;
+            DestroyWindow(overlay);
+            ShowWindow(h, SW_HIDE);
+            ShowWindow(split->window, SW_HIDE);
+            SetWindowPos(split->window, nullptr, splitBounds.left, splitBounds.top, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            smokeReport << "merge-visible-target-discovery: " << ok << '\n';
+
+            // Hover delay, stable popup allocation, feedback and cancellation on hidden test windows.
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            const auto beforeFields = a.fieldTextWrites;
+            POINT title{int((a.fileLeft() + 80) * a.dpi()), int(20 * a.dpi())};
+            ClientToScreen(h, &title);
+            split->beginMergeHover(a, 1000);
+            split->updateMergeTarget(title, 1299);
+            ok = ok && !a.panel && a.mergeSource == split->window && split->mergePreview;
+            split->updateMergeTarget(title, 1300);
+            const HWND expanded = a.panel;
+            const double hoverStart = inputTime();
+            for (int i = 0; i < 500; ++i)
+                split->updateMergeTarget(title, 1301 + i);
+            smokeReport << "merge-hover-500-ms: " << (inputTime() - hoverStart) * 1000 << '\n';
+            ok = ok && expanded && expanded == a.panel && a.fieldTextWrites == beforeFields;
+            BYTE alpha{};
+            DWORD flags{};
+            COLORREF key{};
+            ok = ok && GetLayeredWindowAttributes(split->window, &key, &alpha, &flags) && alpha == 190;
+            RECT previewBounds{};
+            GetWindowRect(split->window, &previewBounds);
+            ok = ok && previewBounds.right - previewBounds.left == LONG(split->moveSize.cx * .94) &&
+                 previewBounds.bottom - previewBounds.top == LONG(split->moveSize.cy * .94);
+            split->doc()->fit = true;
+            split->layout();
+            ok = ok && split->doc()->scale == .75 && split->doc()->scroll == 120;
+            split->doc()->fit = false;
+            POINT drop{int(100 * a.dpi()), int(73 * a.dpi())};
+            ClientToScreen(a.panel, &drop);
+            split->endWindowMove(drop, true);
+            ok = ok && !a.panel && !a.mergeSource && !split->mergePreview && split->sessions.size() == 1 &&
+                 !(GetWindowLongPtrW(split->window, GWL_EXSTYLE) & WS_EX_LAYERED);
+            GetWindowRect(split->window, &previewBounds);
+            ok = ok && previewBounds.right - previewBounds.left == split->moveSize.cx &&
+                 previewBounds.bottom - previewBounds.top == split->moveSize.cy;
+            smokeReport << "merge-cancel: " << ok << '\n';
+
+            // Dropping before expansion or outside the list must leave the source alive.
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            split->beginMergeHover(a, 2000);
+            split->endWindowMove(title, false);
+            ok = ok && split->sessions.size() == 1 && a.sessions.empty();
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            split->beginMergeHover(a, 3000);
+            split->updateMergeTarget(title, 3300);
+            split->endWindowMove({-32000, -32000}, false);
+            ok = ok && split->sessions.size() == 1 && !a.panel;
+
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            split->beginMergeHover(a, 3400);
+            split->updateMergeTarget({-32000, -32000}, 3500);
+            ok = ok && !split->mergeTarget && !split->mergePreview && !a.mergeSource;
+            split->beginMergeHover(a, 3600);
+            split->updateMergeTarget(title, 3899);
+            ok = ok && !a.panel; // Leaving the title resets the full 300 ms delay.
+            split->endWindowMove(title, true);
+
+            // A busy document prevents the whole-window transfer (no partial migration).
+            Session additional;
+            additional.id = a.nextDocument++;
+            additional.path = L"merge-additional.pdf";
+            additional.pages = {{595, 842}};
+            additional.loading = false;
+            additional.fit = false;
+            additional.history.reset({});
+            const auto additionalId = additional.id;
+            split->sessions.push_back(std::move(additional));
+            split->sessions.back().saving = true;
+            ok = !a.mergeWindow(*split) && ok;
+            split->sessions.back().saving = false;
+            ok = ok && split->sessions.size() == 2 && a.sessions.empty();
+
+            Session resident;
+            resident.id = a.nextDocument++;
+            resident.path = std::filesystem::absolute(L"merge-existing.pdf");
+            resident.pages = {{595, 842}};
+            resident.loading = false;
+            resident.fit = false;
+            resident.history.reset({});
+            const auto residentId = resident.id;
+            a.sessions.push_back(std::move(resident));
+            Session tail;
+            tail.id = a.nextDocument++;
+            tail.path = std::filesystem::absolute(L"merge-existing-last.pdf");
+            tail.pages = {{595, 842}};
+            tail.loading = tail.fit = false;
+            tail.history.reset({});
+            const auto tailId = tail.id;
+            a.sessions.push_back(std::move(tail));
+            a.active = 0;
+            a.layout();
+            SendMessageW(split->window, WM_ENTERSIZEMOVE, 0, 0);
+            split->beginMergeHover(a, 4000);
+            split->updateMergeTarget(title, 4300);
+            ok = ok && a.mergeInsertionAt(10) == 0 && a.mergeInsertionAt(54) == 0 &&
+                 a.mergeInsertionAt(87) == 1 && a.mergeInsertionAt(145) == 2;
+            drop = {int(100 * a.dpi()), int(87 * a.dpi())};
+            ClientToScreen(a.panel, &drop);
+            split->updateMergeTarget(drop, 4350);
+            ok = ok && a.mergeInsert == 1 && a.mergeInsertionLineY() == 102;
+            a.menuScroll = 20;
+            ok = ok && a.mergeInsertionAt(67) == 1 && a.mergeInsertionLineY() == 82;
+            a.menuScroll = 0;
+            const HWND insertionPanel = a.panel;
+            for (int i = 0; i < 100; ++i)
+                split->updateMergeTarget(drop, 4351 + i);
+            ok = ok && a.panel == insertionPanel && a.mergeInsert == 1;
+            const HWND mergedWindow = split->window;
+            split->endWindowMove(drop, false);
+            MSG mergeRequest{};
+            const bool queued = PeekMessageW(&mergeRequest, App::broker, mergeWindowsMessage, mergeWindowsMessage, PM_REMOVE);
+            if (queued)
+                DispatchMessageW(&mergeRequest);
+            ok = ok && queued && !IsWindow(mergedWindow) && a.sessions.size() == 4 && a.active == 1 &&
+                 a.doc()->id == transferId && a.doc()->history.fingerprint() == transferHistory &&
+                 a.doc()->textCache.contains(0) && a.doc()->scale == .75 && a.doc()->scroll == 120 &&
+                 a.sessions.front().id == residentId && a.sessions[2].id == additionalId &&
+                 a.sessions.back().id == tailId;
+            a.undo(false);
+            ok = ok && a.doc()->history.current().empty();
+            a.undo(true);
+            ok = ok && a.doc()->history.fingerprint() == transferHistory;
+            smokeReport << "merge-drop-and-history: " << ok << '\n';
+
+            // System maximize and F11 fullscreen both detach at 60%, including the follow-up move size.
+            ShowWindow(h, SW_MAXIMIZE);
+            RECT maximizedBounds{};
+            GetWindowRect(h, &maximizedBounds);
+            const int beforeMaxSplit = a.active;
+            auto *maxSplit = a.detachDocument(a.active);
+            if (maxSplit) {
+                RECT smallBounds{};
+                GetWindowRect(maxSplit->window, &smallBounds);
+                ok = ok && IsZoomed(h) && !a.fullscreen && !IsZoomed(maxSplit->window) &&
+                     smallBounds.right - smallBounds.left == LONG((maximizedBounds.right - maximizedBounds.left) * .6) &&
+                     smallBounds.bottom - smallBounds.top == LONG((maximizedBounds.bottom - maximizedBounds.top) * .6);
+                SendMessageW(maxSplit->window, WM_ENTERSIZEMOVE, 0, 0);
+                ok = ok && maxSplit->moveSize.cx == smallBounds.right - smallBounds.left &&
+                     maxSplit->moveSize.cy == smallBounds.bottom - smallBounds.top;
+                maxSplit->endWindowMove({-32000, -32000}, true);
+                ok = a.mergeWindow(*maxSplit, beforeMaxSplit) && ok;
+            } else
+                ok = false;
+            ShowWindow(h, SW_RESTORE);
+            smokeReport << "split-maximized-size: " << ok << '\n';
+
+            // Fullscreen detachment uses 60% per dimension, leaving the source fullscreen.
+            a.toggleFullscreen();
+            RECT fullBounds{};
+            GetWindowRect(h, &fullBounds);
+            a.down(a.fileLeft() + 20, 2); // Reveal the F11 header, just as a real file-list drag does.
+            a.fileMenu();
+            double activeRowY = 16;
+            for (const auto &row : a.menuRows) {
+                if (row.command == 1000 + a.active) {
+                    activeRowY += a.menuRowHeight(row) / 2;
+                    break;
+                }
+                activeRowY += a.menuRowHeight(row);
+            }
+            const size_t childrenBefore = App::detached.size();
+            const HWND fullMenu = a.panel;
+            SendMessageW(fullMenu, WM_LBUTTONDOWN, MK_LBUTTON,
+                         MAKELPARAM(int(100 * a.dpi()), int(activeRowY * a.dpi())));
+            SendMessageW(fullMenu, WM_MOUSEMOVE, MK_LBUTTON,
+                         MAKELPARAM(int((a.popupWidth() + 40) * a.dpi()), int(activeRowY * a.dpi())));
+            auto *resplit = App::detached.size() > childrenBefore ? App::detached.back().get() : nullptr;
+            if (resplit) {
+                RECT smallBounds{};
+                GetWindowRect(resplit->window, &smallBounds);
+                ok = ok && a.fullscreen && !resplit->fullscreen &&
+                     smallBounds.right - smallBounds.left == LONG((fullBounds.right - fullBounds.left) * .6) &&
+                     smallBounds.bottom - smallBounds.top == LONG((fullBounds.bottom - fullBounds.top) * .6);
+                split = resplit;
+            } else
+                ok = false;
+            a.toggleFullscreen();
+            smokeReport << "split-fullscreen-size: " << ok << '\n';
+            a.closeWindow();
+            ok = ok && IsWindow(split->window) && split->engine && App::windows.size() == 1;
+            smokeReport << "close-original: " << ok << " windows=" << App::windows.size() << '\n';
+            split->closeWindow();
+            ok = ok && split->closePrompt == transferId;
+            smokeReport << "split-prompt: " << ok << " prompt=" << split->closePrompt << " expected=" << transferId << '\n';
+            const auto dispatchOpen = [&] {
+                MSG incoming{};
+                if (!PeekMessageW(&incoming, App::broker, openDocumentsMessage, openDocumentsMessage, PM_REMOVE))
+                    return false;
+                DispatchMessageW(&incoming);
+                return true;
+            };
+            ok = forwardOpen(App::broker, {}) && dispatchOpen() && App::deferredOpens.size() == 1 &&
+                 App::pendingOpenRequests == 1 && ok;
+            split->answerClosePrompt(0);
+            ok = ok && IsWindow(split->window) && split->doc()->history.dirty();
+            smokeReport << "split-cancel-close: " << ok << '\n';
+            App::brokerProc(App::broker, WM_TIMER, 1, 0);
+            ok = dispatchOpen() && App::pendingOpenRequests == 0 && ok;
+            split->closeWindow();
+            split->answerClosePrompt(1);
+            ok = ok && App::windows.empty();
+        } else
+            DestroyWindow(h);
+        smokeReport << "completed: " << ok << '\n';
         return ok ? 0 : 3;
     }
     int argc = 0;
@@ -4570,8 +6271,6 @@ int run(HINSTANCE instance, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (SUCCEEDED(com))
-        CoUninitialize();
     return int(msg.wParam);
 }
 } // namespace pb
