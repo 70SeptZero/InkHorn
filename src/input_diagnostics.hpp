@@ -33,6 +33,8 @@ class InputDiagnostics {
     }
     bool pen(UINT message, const POINTER_PEN_INFO &, const char *surface = "main");
     bool message(UINT, WPARAM, LPARAM, const char *surface = "main");
+    void navigation(bool precise, const char *action, int axis = 0);
+    void scrollRange(const SCROLLINFO &);
     void mouseSource(UINT, bool known, const INPUT_MESSAGE_SOURCE &, bool accepted);
 };
 } // namespace pb

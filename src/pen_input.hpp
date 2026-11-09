@@ -3,6 +3,10 @@
 #include <windows.h>
 
 namespace pb {
+inline bool navigationMouseMessage(UINT message) {
+    return message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL ||
+           message == WM_MBUTTONDOWN || message == WM_MBUTTONUP;
+}
 inline bool promotedPointerMouse(LPARAM extra) {
     return (extra & 0xffffff00) == 0xff515700;
 }
@@ -21,6 +25,9 @@ inline bool acceptMouseInput(UINT message, LPARAM extra, bool contact, bool penM
     // Precision touchpads can carry the pointer-promotion signature too.
     // Windows' explicit device classification takes precedence over that tag.
     if (known && source == IMDT_TOUCHPAD)
+        return true;
+    // A driver's explicit navigation events are not promoted tip clicks.
+    if (known && source == IMDT_PEN && navigationMouseMessage(message))
         return true;
     if (promotedPointerMouse(extra) || (known && (source == IMDT_PEN || source == IMDT_TOUCH)))
         return false;

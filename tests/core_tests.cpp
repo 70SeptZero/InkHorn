@@ -54,6 +54,47 @@ int main() {
         require(!parseColorHex(L"#ZZ00FF", rejected) && !parseColorHex(L"#FFFFF", rejected),
                 "reject invalid color input");
         WheelScroll wheel;
+        require(wheelAction(false, false, false) == WheelAction::Vertical &&
+                    wheelAction(false, true, false) == WheelAction::Zoom &&
+                    wheelAction(false, false, true) == WheelAction::Zoom &&
+                    wheelAction(false, true, true) == WheelAction::Zoom &&
+                    wheelAction(true, false, false) == WheelAction::Horizontal &&
+                    wheelAction(true, true, true) == WheelAction::Horizontal &&
+                    wheelAction(false, true, false, true) == WheelAction::Zoom &&
+                    wheelAction(false, false, false, true) == WheelAction::Horizontal &&
+                    wheelAction(false, false, false, false) == WheelAction::Vertical,
+                "Ctrl/Alt zoom, Shift horizontal movement and native wheels must not conflict");
+        AxisLockedPan precisePan;
+        auto displacement = precisePan.step(1, .5);
+        require(displacement.x == 0 && displacement.y == 0 && !precisePan.axis(), "small pen jitter must not lock an axis");
+        displacement = precisePan.step(3, 1);
+        require(displacement.x == 4 && displacement.y == 0 && precisePan.axis() == 1,
+                "dominant axis must retain the initial displacement without diagonal motion");
+        displacement = precisePan.step(-2, 40);
+        require(displacement.x == -2 && displacement.y == 0, "selected axis must stay locked and reverse immediately");
+        precisePan.reset();
+        displacement = precisePan.step(1, -4);
+        require(displacement.x == 0 && displacement.y == -4 && precisePan.axis() == 2, "a new drag can choose vertical");
+        displacement = precisePan.step(0, 0);
+        require(displacement.x == 0 && displacement.y == 0, "precision pan must have no trailing movement");
+        precisePan.reset();
+        precisePan.step(10, 1, 1);
+        displacement = precisePan.step(0, 8, 1.1);
+        require(displacement.x == 0 && displacement.y == 0 && precisePan.axis() == 1,
+                "continuous motion must keep the selected axis before the pause threshold");
+        displacement = precisePan.step(0, 9, 1.4);
+        require(displacement.x == 0 && displacement.y == 9 && precisePan.axis() == 2,
+                "a gap between driver events must allow a new axis without lifting the pen");
+        precisePan.reset();
+        precisePan.step(10, 0, 2);
+        precisePan.step(0, 0, 2.1);
+        precisePan.step(.1, 0, 2.15);
+        displacement = precisePan.step(-.1, 0, 2.25);
+        require(displacement.x == 0 && displacement.y == 0 && precisePan.axis() == 0,
+                "stationary packets and tiny jitter must allow the old axis to expire");
+        displacement = precisePan.step(0, -8, 2.26);
+        require(displacement.x == 0 && displacement.y == -8,
+                "relocking must apply only new movement without replaying suppressed motion");
         wheel.add(90, 0);
         const double wheelFirst = wheel.tick(.016), wheelSecond = wheel.tick(.032);
         require(wheelFirst > wheelSecond && wheelSecond > 0 && wheelFirst < 45,

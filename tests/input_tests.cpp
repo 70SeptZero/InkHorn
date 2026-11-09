@@ -10,13 +10,18 @@ int main() {
             if (!acceptMouseInput(message, 0xff515780, false, true, true, IMDT_TOUCHPAD) ||
                 !acceptMouseInput(message, 0, false, true, true, IMDT_MOUSE) ||
                 acceptMouseInput(message, 0xff515780, false, true, true, IMDT_TOUCH) ||
-                acceptMouseInput(message, 0, false, true, true, IMDT_PEN) ||
+                (acceptMouseInput(message, 0, false, true, true, IMDT_PEN) != navigationMouseMessage(message)) ||
                 acceptMouseInput(message, 0, true, true, true, IMDT_TOUCHPAD))
                 throw std::runtime_error("touchpad must restore pointer, but pen contact must retain ownership");
         }
         if (acceptMouseInput(WM_MOUSEMOVE, 0, false, true, false, IMDT_UNAVAILABLE) ||
             acceptMouseInput(WM_MOUSEMOVE, 0xff515780, false, true, false, IMDT_UNAVAILABLE))
             throw std::runtime_error("synthetic or unclassified promoted moves must not interrupt pen hover");
+        for (UINT message : {WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_MBUTTONDOWN, WM_MBUTTONUP}) {
+            if (!acceptMouseInput(message, 0xff515710, false, true, true, IMDT_PEN) ||
+                acceptMouseInput(message, 0xff515710, true, true, true, IMDT_PEN))
+                throw std::runtime_error("explicit pen navigation must work without interrupting an owned ink contact");
+        }
         for (int selected = 0; selected <= 5; ++selected) {
             InputToolMode mode;
             int tool = 0;
@@ -106,6 +111,17 @@ int main() {
         diagnostics.message(WM_KEYDOWN, 'Z', 0);
         diagnostics.message(WM_KEYUP, 'Z', 0, "edit");
         diagnostics.message(WM_RBUTTONDOWN, 0, 0);
+        diagnostics.message(WM_MOUSEWHEEL, MAKEWPARAM(0, -30), 0);
+        diagnostics.message(WM_MOUSEHWHEEL, MAKEWPARAM(0, 60), 0);
+        diagnostics.message(WM_POINTERWHEEL, MAKEWPARAM(9, -120), 0);
+        diagnostics.message(WM_POINTERHWHEEL, MAKEWPARAM(9, 120), 0);
+        diagnostics.message(WM_HSCROLL, SB_LINERIGHT, 0);
+        diagnostics.message(WM_VSCROLL, SB_LINEUP, 0);
+        diagnostics.message(WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, 10), 0);
+        diagnostics.navigation(false, "zoom");
+        diagnostics.navigation(true, "driver-pan", 1);
+        SCROLLINFO range{sizeof(range), SIF_ALL, 0, 1500, 800, 200};
+        diagnostics.scrollRange(range);
         INPUT_MESSAGE_SOURCE source{IMDT_TOUCHPAD, IMO_HARDWARE};
         diagnostics.mouseSource(WM_MOUSEMOVE, true, source, true);
         const auto file = diagnostics.file();
@@ -114,7 +130,11 @@ int main() {
         const std::string text((std::istreambuf_iterator<char>(input)), {});
         input.close();
         for (const auto *value : {"ERASER=1", "BARREL=1", "INVERTED=1", "pressure=512", "KEY_DOWN",
-                                  "edit KEY_UP", "MOUSE_RIGHT_DOWN", "MOUSE_SOURCE=TOUCHPAD", "accepted=1", "STOP"})
+                                  "edit KEY_UP", "MOUSE_RIGHT_DOWN", "MOUSE_SOURCE=TOUCHPAD", "accepted=1", "STOP",
+                                  "MOUSE_WHEEL", "MOUSE_HWHEEL", "POINTER_WHEEL", "POINTER_HWHEEL", "delta=-30", "delta=60",
+                                  "HSCROLL", "VSCROLL", "command=1(LINE_FORWARD)", "command=0(LINE_BACK)", "wheelCtrl=1",
+                                  "diagnostic v5", "NAVIGATION precise=0 axis=0 action=zoom", "NAVIGATION precise=1 axis=1 action=driver-pan",
+                                  "HORIZONTAL_RANGE min=0 max=1500 page=800 position=200"})
             if (text.find(value) == std::string::npos)
                 throw std::runtime_error("diagnostic log lost input evidence");
         std::filesystem::remove(file);

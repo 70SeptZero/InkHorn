@@ -82,6 +82,55 @@ inline double inputTime() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+enum class WheelAction { Vertical, Horizontal, Zoom };
+inline WheelAction wheelAction(bool horizontalMessage, bool control, bool alt, bool shift = false) {
+    if (horizontalMessage) return WheelAction::Horizontal;
+    if (control || alt) return WheelAction::Zoom;
+    return shift ? WheelAction::Horizontal : WheelAction::Vertical;
+}
+
+// Input displacement in viewport units. Accumulate the initial dead zone, then
+// keep one axis until a pause or reset; no velocity/tail is accumulated.
+class AxisLockedPan {
+    double pendingX_{}, pendingY_{};
+    double motionX_{}, motionY_{}, lastMotion_{};
+    bool timed_{};
+    int axis_{}; // 0 undecided, 1 horizontal, 2 vertical
+  public:
+    static constexpr double pauseSeconds = .2;
+    void reset() {
+        pendingX_ = pendingY_ = motionX_ = motionY_ = lastMotion_ = 0;
+        axis_ = 0;
+        timed_ = false;
+    }
+    int axis() const { return axis_; }
+    Point step(double dx, double dy, double time = inputTime()) {
+        if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(time)) return {};
+        if (axis_ && timed_ && time - lastMotion_ >= pauseSeconds) reset();
+        // Stationary packets and subpixel sensor jitter must not keep the old
+        // direction locked. Accumulation still recognizes deliberate slow motion.
+        if (dx || dy) {
+            motionX_ += dx;
+            motionY_ += dy;
+            if (!timed_ || std::max(std::abs(motionX_), std::abs(motionY_)) >= .5) {
+                lastMotion_ = time;
+                timed_ = true;
+                motionX_ = motionY_ = 0;
+            }
+        }
+        if (!axis_) {
+            pendingX_ += dx;
+            pendingY_ += dy;
+            if (std::max(std::abs(pendingX_), std::abs(pendingY_)) < 3) return {};
+            axis_ = std::abs(pendingX_) >= std::abs(pendingY_) ? 1 : 2;
+            dx = pendingX_;
+            dy = pendingY_;
+            pendingX_ = pendingY_ = 0;
+        }
+        return {axis_ == 1 ? dx : 0, axis_ == 2 ? dy : 0, 0};
+    }
+};
+
 // Wheel input adds a small bounded distance, consumed by the existing animation timer.
 // No thread or document work is needed here; reversing discards the old direction's tail.
 class WheelScroll {

@@ -7,6 +7,7 @@
 #include "pdf_engine.hpp"
 #include "pen_input.hpp"
 #include "runtime_trace.hpp"
+#include "shortcuts.hpp"
 #include "storage.hpp"
 #include "ui.hpp"
 #include "window_routing.hpp"
@@ -104,6 +105,12 @@ struct App {
     ToolIcons icons;
     RangeCursor rangeCursor;
     InputDiagnostics diagnostics;
+    SCROLLINFO horizontalScrollInfo{};
+    AxisLockedPan contactPanAxis, driverPanAxis;
+    bool preciseContactPan{}, verticalContactPan{}, driverPanActive{}, navigationPenMessage{}, navigationTouchpadMessage{};
+    double lastPenInput{-1e12};
+    Point precisePanPoint{};
+    std::optional<double> driverHorizontalTarget;
     bool penTemporaryEraser{}, mouseContact{}, penPositionKnown{};
     POINT penScreen{};
     PenContact penContact;
@@ -117,8 +124,16 @@ struct App {
     HGDIOBJ popupOldBitmap{};
     HBRUSH fieldBackground{};
     HWND tooltips{};
+    std::array<std::wstring, 10> tooltipLabels;
     bool popupDragging{}, toolbarDraggable{}, toolbarMoved{};
-    enum class PanelKind { Tool, Functions, Files, Color, About } panelKind{PanelKind::Tool};
+    enum class PanelKind { Tool, Functions, Files, Color, Settings } panelKind{PanelKind::Tool};
+    Shortcuts shortcuts;
+    int settingsTab{}, recordingShortcut{-1};
+    std::wstring settingsFeedback;
+    UINT settingsTouch{};
+    double settingsTouchY{}, settingsTouchScroll{};
+    int settingsTouchRow{-1};
+    bool settingsTouchMoved{};
     struct MenuRow {
         int command{};
         std::wstring label, detail;
@@ -172,8 +187,11 @@ struct App {
     double toolbarAnchorX{1}, toolbarAnchorY{.5}, toolbarGrabX{}, toolbarGrabY{};
     int hoverControl{-1};
     UINT activePointer{};
-    ScrollMomentum momentum;
-    WheelScroll wheel;
+    ScrollMomentum momentum, horizontalMomentum;
+    WheelScroll wheel, horizontalWheel;
+    bool spacePanHeld{}, middlePan{}, altWheelZoomed{};
+    ULONGLONG pinchDistance{};
+    DWORD pinchInstance{};
     InkStabilizer stabilizer;
     struct StrokeGeometry {
         std::vector<ComPtr<ID2D1PathGeometry>> chunks;
@@ -216,8 +234,7 @@ struct App {
     Point startPoint{}, lastScreen{};
     double startScroll{}, startHorizontal{}, panelScroll{};
     int gesturePage{-1};
-    bool penNear{}, fullscreen{}, showHeader{true}, dark{}, leftHand{}, fitGuard{}, quitting{}, smoke{},
-        horizontalPan{};
+    bool penNear{}, fullscreen{}, showHeader{true}, dark{}, leftHand{}, fitGuard{}, quitting{}, smoke{};
     WINDOWPLACEMENT placement{};
     std::wstring notice;
     std::wstring toast;
@@ -580,6 +597,7 @@ struct App {
         out->leftHand = leftHand;
         out->dark = dark;
         out->toolbarDraggable = toolbarDraggable;
+        out->shortcuts = shortcuts;
         out->recent = recent;
         prepareTransfer(session);
         out->sessions.push_back(std::move(session));
@@ -625,9 +643,11 @@ struct App {
             showToast(L"输入诊断已结束，日志已保存");
         } else {
             const auto directory = diagnosticDirectory();
-            if (!directory.empty() && diagnostics.start(directory))
+            if (!directory.empty() && diagnostics.start(directory)) {
+                diagnostics.navigation(driverPanActive, "start", driverPanAxis.axis());
+                diagnostics.scrollRange(horizontalScrollInfo);
                 showToast(L"输入诊断已开启，请测试侧键");
-            else
+            } else
                 showToast(L"无法创建输入诊断日志");
         }
     }
@@ -936,7 +956,8 @@ struct App {
             const float w = float(std::min(860.0, width() - 160)), x = float((width() - w) / 2);
             const float y = float(height() - 90);
             rect(D2D1::RectF(x, y, x + w, y + 58), {238, 243, 253, 245}, 14);
-            text(L"笔输入诊断 · Ctrl+Shift+D 结束 · Ctrl+Shift+L 日志目录",
+            text(L"笔输入诊断 · " + chordLabel(shortcuts.forCommand(17)) + L" 结束 · " +
+                     chordLabel(shortcuts.forCommand(18)) + L" 日志目录",
                  D2D1::RectF(x + 16, y + 8, x + w - 16, y + 29), Theme::accent, true);
             text(diagnostics.last(), D2D1::RectF(x + 16, y + 31, x + w - 16, y + 53), Theme::text, true);
         }
@@ -1022,6 +1043,9 @@ struct App {
             effective == 1 || effective == 2 ? pressureWidth(1, widths[effective], true) : widths[effective];
         return width * doc()->scale;
     }
+    HCURSOR panCursor() const {
+        return LoadCursorW(nullptr, verticalContactPan ? IDC_ARROW : IDC_SIZEALL);
+    }
     void updateCursorAt(double x, double y) {
         if (smoke)
             return;
@@ -1032,6 +1056,11 @@ struct App {
         }
         if (toolbarHandle(x, y) || gesture == Gesture::Toolbar) {
             SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            return;
+        }
+        if (gesture == Gesture::Pan || (spacePanHeld && doc() && !doc()->loading &&
+            y >= header() && !toolbarContains(x, y))) {
+            SetCursor(gesture == Gesture::Pan ? panCursor() : LoadCursorW(nullptr, IDC_SIZEALL));
             return;
         }
         if (auto *s = doc(); s && tool == 0 && !closePrompt && y >= header() &&
@@ -1076,11 +1105,27 @@ struct App {
     bool mouseInput(UINT message) {
         INPUT_MESSAGE_SOURCE source{};
         const bool known = GetCurrentInputMessageSource(&source) != FALSE;
+        navigationPenMessage = known && source.deviceType == IMDT_PEN;
+        navigationTouchpadMessage = known && source.deviceType == IMDT_TOUCHPAD;
+        if (message == WM_MOUSEMOVE && (navigationTouchpadMessage ||
+            (known && source.deviceType == IMDT_MOUSE && !promotedPointerMouse(GetMessageExtraInfo())))) {
+            endDriverPan();
+            lastPenInput = -1e12;
+        }
+        if (mouseContact && gesture == Gesture::Pan && message == WM_MOUSEMOVE &&
+            (!promotedPointerMouse(GetMessageExtraInfo()) || (middlePan && known && source.deviceType == IMDT_PEN)))
+            return true;
         const bool accepted = acceptMouseInput(message, GetMessageExtraInfo(), penContact.active(),
                                                inputToolMode.penActive(), known, source.deviceType);
         diagnostics.mouseSource(message, known, source, accepted);
         if (!accepted)
             return false;
+        if (known && source.deviceType == IMDT_PEN && navigationMouseMessage(message))
+            return true;
+        if (spacePanHeld || middlePan || gesture == Gesture::Pan || navigationMouseMessage(message)) {
+            penNear = penTemporaryEraser = penPositionKnown = false;
+            return true; // View navigation must not replace a selected pen/shape with the pointer.
+        }
         const bool changed = inputToolMode.mouse(tool);
         penNear = penTemporaryEraser = penPositionKnown = false;
         if (changed)
@@ -1090,38 +1135,112 @@ struct App {
     void stopInertia() {
         momentum.stop();
         wheel.stop();
+        horizontalMomentum.stop();
+        horizontalWheel.stop();
         if (window)
             KillTimer(window, 2);
     }
-    void beginPan(double x, double y, bool horizontal) {
+    void endDriverPan() {
+        driverPanActive = false;
+        driverPanAxis.reset();
+        driverHorizontalTarget.reset();
+    }
+    bool recentPenInput(double time = inputTime()) const {
+        return time >= lastPenInput && time - lastPenInput < .25;
+    }
+    void driverPan(double dx, double dy, double time = inputTime()) {
+        if (!doc() || doc()->loading || closePrompt || panel || gesture != Gesture::None) return;
         stopInertia();
+        driverPanActive = true;
+        const auto movement = driverPanAxis.step(dx, dy, time);
+        doc()->horizontal += movement.x;
+        doc()->scroll += movement.y;
+        clampScroll();
+        diagnostics.navigation(true, "driver-pan", driverPanAxis.axis());
+        if (movement.x || movement.y) {
+            rememberView();
+            requestPage();
+            invalidate();
+        }
+    }
+    void beginPan(double x, double y, bool precise = false, bool verticalOnly = false) {
+        stopInertia();
+        endDriverPan();
+        preciseContactPan = precise;
+        verticalContactPan = verticalOnly;
+        contactPanAxis.reset();
+        precisePanPoint = {x, y, 0};
         if (closePrompt)
             return;
         auto *s = doc();
-        if (!s || s->loading)
+        if (!s || s->loading || s->closing)
             return;
         gesture = Gesture::Pan;
         lastScreen = {x, y, 0};
         startScroll = s->scroll;
         startHorizontal = s->horizontal;
-        horizontalPan = horizontal;
         momentum.begin(s->scroll, inputTime());
+        horizontalMomentum.begin(s->horizontal, inputTime());
+    }
+    void holdPan(bool held) {
+        if (spacePanHeld == held) return;
+        spacePanHeld = held;
+        if (held && (penContact.active() || mouseContact) && gesture != Gesture::None &&
+            gesture != Gesture::Pan && gesture != Gesture::Toolbar) {
+            POINT position = penScreen;
+            if (penContact.active() || GetCursorPos(&position)) {
+                ScreenToClient(window, &position);
+                finishGesture();
+                beginPan(position.x / dpi(), position.y / dpi(), penContact.active());
+            }
+        }
+        refreshCursor();
+    }
+    void middleDown(double x, double y, bool precise = false) {
+        if (!doc() || doc()->loading || closePrompt || y < header() || toolbarContains(x, y) || penContact.active())
+            return;
+        const auto search = searchBox();
+        if (searchVisible && x >= search.left && x <= search.right && y >= search.top && y <= search.bottom)
+            return;
+        if (!smoke) SetFocus(window);
+        closePanel();
+        if (gesture != Gesture::None) finishGesture();
+        beginPan(x, y, precise);
+        if (gesture == Gesture::Pan) {
+            mouseContact = middlePan = true;
+            SetCapture(window);
+            refreshCursor();
+        }
+    }
+    bool scrolling() const {
+        return momentum.active() || wheel.active() || horizontalMomentum.active() || horizontalWheel.active();
     }
     void animateScroll(double time = inputTime()) {
         auto *s = doc();
-        if (!s || s->loading || gesture != Gesture::None || (!momentum.active() && !wheel.active())) {
+        if (!s || s->loading || gesture != Gesture::None || !scrolling()) {
             stopInertia();
             return;
         }
         const double delta = wheel.active() ? wheel.tick(time) : momentum.tick(time);
+        const double horizontalDelta = horizontalWheel.active() ? horizontalWheel.tick(time) : horizontalMomentum.tick(time);
         const double previous = s->scroll;
+        const double previousHorizontal = s->horizontal;
         s->scroll += delta;
+        s->horizontal += horizontalDelta;
         clampScroll();
-        if (std::abs(s->scroll - previous - delta) > .01 || (!momentum.active() && !wheel.active())) {
-            stopInertia();
+        if (std::abs(s->scroll - previous - delta) > .01) {
+            momentum.stop();
+            wheel.stop();
+        }
+        if (std::abs(s->horizontal - previousHorizontal - horizontalDelta) > .01) {
+            horizontalMomentum.stop();
+            horizontalWheel.stop();
+        }
+        if (!scrolling()) {
+            KillTimer(window, 2);
             rememberView();
         }
-        if (s->scroll != previous) {
+        if (s->scroll != previous || s->horizontal != previousHorizontal) {
             requestPage();
             invalidate();
         }
@@ -1135,10 +1254,8 @@ struct App {
                                    L"整笔橡皮 · 擦除整条笔迹",
                                    L"荧光笔 · 再次点击设置",
                                    L"形状 · 再次点击设置",
-                                   L"撤销 · Ctrl+Z",
-                                   L"重做 · Ctrl+Y",
-                                   L"保存 · Ctrl+S",
-                                   L"搜索正文 · Ctrl+F"};
+                                   L"撤销", L"重做", L"保存", L"搜索正文"};
+        const int commands[] = {30, 31, 32, 33, 34, 35, 15, 16, 14, 19};
         const auto tb = toolbar();
         for (int i = 0; i < 10; ++i) {
             const double y = tb.top + toolsTop() + i * 46 + (i >= 6 ? 12 : 0) - panelScroll;
@@ -1152,10 +1269,12 @@ struct App {
             if (bottom > top)
                 info.rect = {LONG(tb.left * dpi()), LONG(top * dpi()), LONG(tb.right * dpi()),
                              LONG(bottom * dpi())};
-            info.lpszText = const_cast<wchar_t *>(labels[i]);
+            const auto chord = shortcuts.forCommand(commands[i]);
+            tooltipLabels[size_t(i)] = std::wstring(labels[i]) + (chord.key ? L" · " + chordLabel(chord) : L"");
+            info.lpszText = tooltipLabels[size_t(i)].data();
             if (!SendMessageW(tooltips, TTM_GETTOOLINFOW, 0, reinterpret_cast<LPARAM>(&info))) {
                 info.uFlags = TTF_SUBCLASS | TTF_TRANSPARENT;
-                info.lpszText = const_cast<wchar_t *>(labels[i]);
+                info.lpszText = tooltipLabels[size_t(i)].data();
                 SendMessageW(tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
             } else {
                 if (bottom > top)
@@ -1164,6 +1283,8 @@ struct App {
                 else
                     info.rect = {};
                 SendMessageW(tooltips, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&info));
+                info.lpszText = tooltipLabels[size_t(i)].data();
+                SendMessageW(tooltips, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&info));
             }
         }
     }
@@ -1219,9 +1340,7 @@ struct App {
         if (storage && s && !s->loading && !smoke)
             storage->writeView(s->path, {s->page, s->scale, s->scroll, s->horizontal, s->fit, s->hidden});
     }
-    void persistSettings() {
-        if (!storage || smoke)
-            return;
+    std::string settingsText() const {
         std::ostringstream out;
         out.imbue(std::locale::classic());
         out << "PBSET1 " << dark << ' ' << leftHand << " 0 " << int(shapeKind);
@@ -1233,12 +1352,18 @@ struct App {
             out << ' ' << int(c.r) << ' ' << int(c.g) << ' ' << int(c.b) << ' ' << int(c.a);
         out << " PBUI2 " << toolbarDraggable << ' ' << toolbarMoved << ' ' << toolbarAnchorX << ' '
             << toolbarAnchorY;
-        storage->writeSettings(out.str());
+        shortcuts.write(out);
+        return out.str();
+    }
+    void persistSettings() {
+        if (storage && !smoke)
+            storage->writeSettings(settingsText());
     }
     void loadSettings() {
-        if (!storage)
-            return;
-        std::istringstream in(storage->readSettings());
+        if (storage) parseSettings(storage->readSettings());
+    }
+    void parseSettings(const std::string &data) {
+        std::istringstream in(data);
         in.imbue(std::locale::classic());
         std::string magic;
         bool d, l;
@@ -1279,6 +1404,7 @@ struct App {
             toolbarMoved = moved;
             toolbarAnchorX = x;
             toolbarAnchorY = y;
+            shortcuts.read(in); // Optional extension; older settings keep the default shortcuts.
         }
     }
     void color(Color c) {
@@ -1510,12 +1636,25 @@ struct App {
         return s ? topOf(int(s->pages.size())) : 0;
     }
     void clampScroll() {
+        double widest = 0;
         if (auto *s = doc()) {
             s->scroll = std::clamp(s->scroll, 0.0, std::max(0.0, totalHeight() - bodyHeight() + 20));
-            double widest = 0;
             for (auto size : s->pages)
                 widest = std::max(widest, size.w * s->scale);
             s->horizontal = std::clamp(s->horizontal, 0.0, std::max(0.0, widest - (width() - 148)));
+        }
+        // Wacom's default PanLeft/Right mapping uses a native scrollbar, not a
+        // horizontal wheel. Publish a real range/position for driver discovery.
+        // The custom full-client frame has no nonclient scrollbar to paint.
+        const double viewport = std::max(1.0, width() - 148);
+        SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL};
+        info.nPage = UINT(std::clamp(std::round(viewport * dpi()), 1.0, 1e9));
+        info.nMax = int(std::clamp(std::ceil(std::max(widest, viewport) * dpi()), 1.0, 1e9)) - 1;
+        info.nPos = doc() ? int(std::clamp(std::round(doc()->horizontal * dpi()), 0.0, 1e9)) : 0;
+        if (info.nMax != horizontalScrollInfo.nMax || info.nPage != horizontalScrollInfo.nPage ||
+            info.nPos != horizontalScrollInfo.nPos || !horizontalScrollInfo.cbSize) {
+            horizontalScrollInfo = info; // Set before USER32 can reenter layout.
+            SetScrollInfo(window, SB_HORZ, &info, FALSE);
         }
     }
     int pageAt(double x, double y, bool requireInside = true) {
@@ -2500,6 +2639,571 @@ struct App {
     void functionsMenu() {
         openPopup(PanelKind::Functions);
     }
+    bool navigationCheck() {
+        std::ofstream report("navigation-check-results.txt");
+        bool ok = true;
+        auto check = [&](const char *name, bool passed) { report << name << ": " << passed << std::endl; ok = passed && ok; };
+        Session session;
+        session.id = 900;
+        session.path = L"navigation-test.pdf";
+        session.pages = {{595, 842}, {595, 842}};
+        session.loading = session.fit = false;
+        session.scale = 2;
+        session.scroll = session.horizontal = 200;
+        session.history.reset({{1, 0, Kind::Ink, {21, 101, 192, 255}, 2, {{150, 150, 2}, {240, 150, 2}}}});
+        sessions.push_back(std::move(session));
+        active = 0;
+        tool = 1;
+        layout();
+        inputToolMode.pen(tool);
+        const double x = width() / 2, y = header() + 90;
+        const auto history = doc()->history.fingerprint();
+        const auto point = [&](double xx, double yy) { return MAKELPARAM(int(std::round(xx * dpi())), int(std::round(yy * dpi()))); };
+        const auto resetView = [&] { stopInertia(); endDriverPan(); lastPenInput = -1e12;
+                                    doc()->horizontal = doc()->scroll = 200; clampScroll(); };
+        const auto settle = [&](double start) { for (int i = 1; i <= 20; ++i) animateScroll(start + i * .016); };
+        SCROLLINFO nativeRange{sizeof(nativeRange), SIF_RANGE | SIF_PAGE | SIF_POS};
+        RECT nativeClient{}, nativeWindow{};
+        GetClientRect(window, &nativeClient);
+        GetWindowRect(window, &nativeWindow);
+        check("driver-can-discover-native-horizontal-range", GetScrollInfo(window, SB_HORZ, &nativeRange) &&
+              (GetWindowLongPtrW(window, GWL_STYLE) & WS_HSCROLL) && nativeRange.nMax - int(nativeRange.nPage) + 1 > 0 &&
+              std::abs(nativeRange.nPos / dpi() - doc()->horizontal) < 1);
+        check("native-range-keeps-full-client-frame", nativeClient.right == nativeWindow.right - nativeWindow.left &&
+              nativeClient.bottom == nativeWindow.bottom - nativeWindow.top);
+        SendMessageW(window, WM_KEYDOWN, VK_SPACE, 0);
+        report << "space-key-state: held=" << spacePanHeld << " ctrl=" << (GetKeyState(VK_CONTROL) < 0)
+               << " alt=" << (GetKeyState(VK_MENU) < 0) << std::endl;
+        SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, point(x, y));
+        report << "space-down-state: gesture=" << int(gesture) << " tool=" << tool << " held=" << spacePanHeld
+               << " close=" << closePrompt << " pen-contact=" << penContact.active() << std::endl;
+        check("space-starts-pan-with-pen-selected", gesture == Gesture::Pan && tool == 1 && spacePanHeld);
+        SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, point(x - 60, y - 40));
+        SendMessageW(window, WM_KEYUP, VK_SPACE, 0);
+        check("space-release-does-not-draw-during-contact", !spacePanHeld && gesture == Gesture::Pan);
+        SendMessageW(window, WM_LBUTTONUP, 0, point(x - 60, y - 40));
+        check("space-drag-both-axes", std::abs(doc()->horizontal - 260) < 1 && std::abs(doc()->scroll - 240) < 1 &&
+              gesture == Gesture::None && tool == 1 && doc()->history.fingerprint() == history);
+        resetView();
+        SendMessageW(window, WM_MBUTTONDOWN, MK_MBUTTON, point(x, y));
+        SendMessageW(window, WM_MOUSEMOVE, MK_MBUTTON, point(x - 70, y - 30));
+        SendMessageW(window, WM_MBUTTONUP, 0, point(x - 70, y - 30));
+        check("middle-drag-both-axes", !middlePan && !mouseContact && std::abs(doc()->horizontal - 270) < 1 &&
+              std::abs(doc()->scroll - 230) < 1 && tool == 1 && doc()->history.fingerprint() == history);
+        resetView();
+        tool = 0;
+        down(4, y);
+        check("side-blank-pan-uses-arrow-and-vertical-coarse-mode", gesture == Gesture::Pan && !preciseContactPan &&
+              verticalContactPan && panCursor() == LoadCursorW(nullptr, IDC_ARROW));
+        move(-46, y - 40);
+        finishGesture();
+        check("side-blank-drag-vertical-only", doc()->horizontal == 200 && doc()->scroll == 240);
+        resetView();
+        tool = 1;
+        down(4, y);
+        const double coarseTime = inputTime();
+        momentum.begin(doc()->scroll, coarseTime - .04);
+        move(-46, y - 80, .5, false, coarseTime - .02);
+        finishGesture(true);
+        check("side-blank-retains-vertical-inertia-only", momentum.active() && !horizontalMomentum.active());
+        animateScroll(inputTime() + .016);
+        check("side-blank-coast-cannot-drift-horizontally", doc()->horizontal == 200 && doc()->scroll > 280);
+        resetView();
+        scroll(.25, x, y, 10, true);
+        settle(10);
+        check("fractional-native-horizontal-wheel", std::abs(doc()->horizontal - 222.5) < .01 && doc()->scroll == 200 && !scrolling());
+        resetView();
+        POINT screen{int(x * dpi()), int(y * dpi())};
+        ClientToScreen(window, &screen);
+        const LPARAM screenPoint = MAKELPARAM(screen.x, screen.y);
+        double start = inputTime();
+        BYTE originalKeys[256]{};
+        GetKeyboardState(originalKeys);
+        BYTE keys[256];
+        std::copy(std::begin(originalKeys), std::end(originalKeys), keys);
+        keys[VK_CONTROL] = keys[VK_LCONTROL] = 0x80;
+        SetKeyboardState(keys);
+        SendMessageW(window, WM_KEYDOWN, VK_CONTROL, 0x1d0001);
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, 60), screenPoint);
+        check("ctrl-key-and-wheel-pinch-zoom", std::abs(doc()->scale - 2 * std::sqrt(1.1)) < 1e-8 &&
+              !altWheelZoomed && !scrolling());
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(0, 60), screenPoint);
+        check("ctrl-key-state-only-zooms", std::abs(doc()->scale - 2 * 1.1) < 1e-8 && !scrolling());
+        keys[VK_CONTROL] = keys[VK_LCONTROL] = keys[VK_RCONTROL] = 0;
+        SetKeyboardState(keys);
+        SendMessageW(window, WM_KEYUP, VK_CONTROL, 0xc01d0001);
+        const auto pinchScale = doc()->scale;
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, -60), screenPoint);
+        check("pinch-with-wheel-flag-only-zooms", std::abs(doc()->scale - pinchScale / std::sqrt(1.1)) < 1e-8);
+        setScale(2);
+        resetView();
+        start = inputTime();
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_SHIFT, -120), screenPoint);
+        settle(start);
+        check("shift-wheel-horizontal-not-zoom", std::abs(doc()->horizontal - 290) < .01 &&
+              doc()->scroll == 200 && doc()->scale == 2);
+        SetKeyboardState(originalKeys);
+        setScale(2);
+        resetView();
+        start = inputTime();
+        SendMessageW(window, WM_HSCROLL, SB_LINERIGHT, 0);
+        SendMessageW(window, WM_VSCROLL, SB_LINEDOWN, 0);
+        SendMessageW(window, WM_HSCROLL, SB_ENDSCROLL, 0);
+        settle(start);
+        check("legacy-driver-scroll-both-axes", std::abs(doc()->horizontal - 236) < .01 && std::abs(doc()->scroll - 236) < .01);
+        start = inputTime();
+        SendMessageW(window, WM_HSCROLL, SB_LINELEFT, 0);
+        SendMessageW(window, WM_VSCROLL, SB_LINEUP, 0);
+        settle(start);
+        check("legacy-driver-scroll-reverse", std::abs(doc()->horizontal - 200) < .01 && std::abs(doc()->scroll - 200) < .01);
+        check("child-scroll-control-not-canvas", !legacyScroll(true, SB_LINERIGHT, 1));
+        SendMessageW(window, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, int(240 * dpi())), 0);
+        check("driver-native-horizontal-position", std::abs(doc()->horizontal - 240) < 1 &&
+              std::abs(doc()->scroll - 200) < .01 && doc()->history.fingerprint() == history);
+        resetView();
+        GESTUREINFO pinch{sizeof(pinch)};
+        pinch.dwID = GID_ZOOM;
+        pinch.dwFlags = GF_BEGIN;
+        pinch.dwInstanceID = 12;
+        pinch.ullArguments = 100;
+        pinch.ptsLocation = {SHORT(screen.x), SHORT(screen.y)};
+        zoomGesture(pinch);
+        check("pinch-begin-does-not-jump", doc()->scale == 2);
+        const double anchorBeforeX = (doc()->horizontal + x - paperLeft()) / doc()->scale;
+        const double anchorBeforeY = (doc()->scroll + y - header()) / doc()->scale;
+        pinch.dwFlags = GF_END;
+        pinch.ullArguments = 120;
+        zoomGesture(pinch);
+        check("native-pinch-zoom-anchor", std::abs(doc()->scale - 2.4) < 1e-8 && !pinchDistance &&
+              std::abs((doc()->horizontal + x - paperLeft()) / doc()->scale - anchorBeforeX) < .01 &&
+              std::abs((doc()->scroll + y - header()) / doc()->scale - anchorBeforeY) < .01);
+        setScale(2);
+        resetView();
+        start = inputTime();
+        SendMessageW(window, WM_MOUSEHWHEEL, MAKEWPARAM(0, -60), screenPoint);
+        settle(start);
+        check("touchpad-horizontal-direction", std::abs(doc()->horizontal - 155) < .01 && doc()->scroll == 200);
+        resetView();
+        start = inputTime();
+        SendMessageW(window, WM_POINTERHWHEEL, MAKEWPARAM(99, 120), screenPoint);
+        SendMessageW(window, WM_POINTERWHEEL, MAKEWPARAM(99, -120), screenPoint);
+        settle(start);
+        check("driver-pointer-wheels-both-axes", std::abs(doc()->horizontal - 290) < .01 && std::abs(doc()->scroll - 290) < .01);
+        resetView();
+        doc()->scroll = 0;
+        scroll(1, x, y, 20);
+        scroll(1, x, y, 20, true);
+        settle(20);
+        check("one-axis-edge-keeps-other-axis-moving", doc()->scroll == 0 && std::abs(doc()->horizontal - 290) < .01);
+        resetView();
+        const double oldScale = doc()->scale;
+        const double available = width() - 148;
+        const double centerBefore = (doc()->horizontal + available / 2) / oldScale;
+        scroll(.5, x, y, 30, false, true, true);
+        const double zoomScale = oldScale * std::sqrt(1.1);
+        check("alt-zoom-fractional-center-preserved", std::abs(doc()->scale - zoomScale) < 1e-8 &&
+              std::abs((doc()->horizontal + available / 2) / doc()->scale - centerBefore) < 1e-8);
+        SendMessageW(window, WM_SYSKEYUP, VK_MENU, 0);
+        check("alt-release-clears-menu-suppression", !altWheelZoomed);
+        setScale(2);
+        resetView();
+        tool = 1;
+        auto pen = [&](UINT stamp, double xx, double yy, bool contact, bool middle) {
+            POINTER_PEN_INFO sample{};
+            sample.pointerInfo.pointerType = PT_PEN;
+            sample.pointerInfo.pointerId = 77;
+            sample.pointerInfo.dwTime = stamp;
+            sample.pointerInfo.pointerFlags = POINTER_FLAG_INRANGE | (contact ? POINTER_FLAG_INCONTACT : 0) |
+                                               (middle ? POINTER_FLAG_THIRDBUTTON : 0);
+            sample.pointerInfo.ptPixelLocation = {int(xx * dpi()), int(yy * dpi())};
+            ClientToScreen(window, &sample.pointerInfo.ptPixelLocation);
+            sample.penFlags = PEN_FLAG_BARREL;
+            sample.penMask = PEN_MASK_PRESSURE;
+            sample.pressure = 512;
+            return sample;
+        };
+        holdPan(true);
+        penInput(WM_POINTERDOWN, pen(100, x, y, true, false));
+        penInput(WM_POINTERUPDATE, pen(110, x - 50, y - 30, true, false));
+        penInput(WM_POINTERUP, pen(120, x - 50, y - 30, false, false));
+        holdPan(false);
+        check("pen-space-pan-locks-horizontal-without-erasing", std::abs(doc()->horizontal - 250) < 1 &&
+              doc()->scroll == 200 && !scrolling() && doc()->history.fingerprint() == history && tool == 1);
+        resetView();
+        penInput(WM_POINTERDOWN, pen(200, x, y, true, true));
+        penInput(WM_POINTERUPDATE, pen(210, x - 40, y - 20, true, true));
+        penInput(WM_POINTERUP, pen(220, x - 40, y - 20, false, true));
+        check("pen-third-button-pan-locks-horizontal", std::abs(doc()->horizontal - 240) < 1 && doc()->scroll == 200 &&
+              !scrolling() && doc()->history.fingerprint() == history && tool == 1);
+        resetView();
+        penInput(WM_POINTERDOWN, pen(230, x, y, true, true));
+        penInput(WM_POINTERUPDATE, pen(240, x - 10, y - 60, true, true));
+        penInput(WM_POINTERUPDATE, pen(250, x - 90, y - 60, true, true));
+        penInput(WM_POINTERUP, pen(260, x - 90, y - 60, false, false));
+        check("next-pen-drag-can-lock-vertical", doc()->horizontal == 200 && std::abs(doc()->scroll - 260) < 1 && !scrolling());
+        const double stoppedScroll = doc()->scroll;
+        settle(inputTime());
+        check("pen-release-has-no-tail", doc()->scroll == stoppedScroll && !scrolling());
+        resetView();
+        beginPan(x, y, true);
+        move(x - 40, y - 10, .5, false, 10);
+        move(x - 40, y - 10, .5, false, 10.12);
+        move(x - 40, y - 10, .5, false, 10.25);
+        check("stationary-contact-rearms-axis", gesture == Gesture::Pan && contactPanAxis.axis() == 0 &&
+              doc()->horizontal == 240 && doc()->scroll == 200);
+        move(x - 40, y - 40, .5, false, 10.26);
+        check("contact-pause-allows-horizontal-then-vertical", gesture == Gesture::Pan && contactPanAxis.axis() == 2 &&
+              doc()->horizontal == 240 && doc()->scroll == 230 && !scrolling());
+        finishGesture(true);
+        resetView();
+        driverPan(40, 0, 20);
+        driverPan(0, 40, 20.1);
+        driverPan(0, 30, 20.4);
+        check("driver-pause-relocks-without-release-or-jump", driverPanActive && driverPanAxis.axis() == 2 &&
+              doc()->horizontal == 240 && doc()->scroll == 230 && !scrolling());
+        setScale(3);
+        resetView();
+        penInput(WM_POINTERDOWN, pen(261, x, y, true, true));
+        penInput(WM_POINTERUPDATE, pen(262, x - 40, y - 10, true, true));
+        penInput(WM_POINTERUP, pen(263, x - 40, y - 10, false, false));
+        check("precision-displacement-independent-of-pdf-scale", std::abs(doc()->horizontal - 240) < 1 &&
+              doc()->scroll == 200 && !scrolling());
+        setScale(2);
+        resetView();
+        penInput(WM_POINTERDOWN, pen(270, x, y, true, true));
+        penInput(WM_POINTERUPDATE, pen(280, x + 500, y + 10, true, true));
+        penInput(WM_POINTERUPDATE, pen(290, x + 495, y + 50, true, true));
+        penInput(WM_POINTERUP, pen(295, x + 495, y + 50, false, false));
+        check("precision-edge-reverses-without-dead-travel", std::abs(doc()->horizontal - 5) < 1 && doc()->scroll == 200);
+        resetView();
+        penInput(WM_POINTERUPDATE, pen(296, x, y, false, false));
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(0, -8), screenPoint);
+        check("driver-wheel-applies-immediately", doc()->horizontal == 200 && std::abs(doc()->scroll - 206) < .01 && !scrolling());
+        SendMessageW(window, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, int(240 * dpi())), 0);
+        check("driver-drag-keeps-first-axis", doc()->horizontal == 200 && std::abs(doc()->scroll - 206) < .01 && !scrolling());
+        SendMessageW(window, WM_LBUTTONUP, 0, point(x, y));
+        check("driver-release-unlocks-axis", !driverPanActive && !driverPanAxis.axis());
+        SendMessageW(window, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, int(240 * dpi())), 0);
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(0, -8), screenPoint);
+        SendMessageW(window, WM_HSCROLL, SB_ENDSCROLL, 0);
+        check("driver-next-drag-horizontal-without-tail", std::abs(doc()->horizontal - 240) < 1 &&
+              std::abs(doc()->scroll - 206) < .01 && !scrolling());
+        SendMessageW(window, WM_LBUTTONUP, 0, point(x, y));
+        resetView();
+        penInput(WM_POINTERUPDATE, pen(297, x, y, false, false));
+        for (int i = 0; i < 12; ++i) SendMessageW(window, WM_HSCROLL, SB_LINERIGHT, 0);
+        check("pen-native-lines-use-single-pixel-steps", std::abs(doc()->horizontal - (200 + 12 / dpi())) < .01 &&
+              doc()->scroll == 200 && !scrolling());
+        resetView();
+        penInput(WM_POINTERUPDATE, pen(298, x, y, false, false));
+        for (int i = 1; i <= 8; ++i)
+            SendMessageW(window, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, int(200 * dpi()) + i), 0);
+        check("absolute-driver-positions-do-not-double-count-dead-zone", std::abs(doc()->horizontal - (200 + 8 / dpi())) < .01 &&
+              doc()->scroll == 200 && !scrolling());
+        SendMessageW(window, WM_KILLFOCUS, 0, 0);
+        check("focus-loss-clears-driver-axis", !driverPanActive && !driverPanAxis.axis());
+        resetView();
+        penInput(WM_POINTERDOWN, pen(300, x, y, true, false));
+        check("plain-barrel-remains-eraser", gesture == Gesture::Erase && penTemporaryEraser);
+        cancelGesture();
+        auto drawing = pen(400, x, y, true, false);
+        drawing.penFlags = 0;
+        penInput(WM_POINTERDOWN, drawing);
+        check("normal-pen-returns-to-writing", gesture == Gesture::Draw && !spacePanHeld);
+        scroll(1, x, y, 40, true);
+        check("wheel-does-not-interrupt-contact", gesture == Gesture::Draw && !scrolling() && doc()->horizontal == 200);
+        cancelGesture();
+        holdPan(true);
+        SendMessageW(window, WM_KILLFOCUS, 0, 0);
+        check("focus-loss-clears-space-pan", !spacePanHeld);
+        check("navigation-keeps-history", doc()->history.fingerprint() == history);
+        setScale(.5);
+        GetScrollInfo(window, SB_HORZ, &nativeRange);
+        check("native-range-disabled-when-page-fits", doc()->horizontal == 0 &&
+              nativeRange.nMax - int(nativeRange.nPage) + 1 <= 0);
+        sessions.clear();
+        active = -1;
+        clampScroll();
+        return ok;
+    }
+    bool menuPanel() const {
+        return panelKind == PanelKind::Functions || panelKind == PanelKind::Files ||
+               panelKind == PanelKind::Settings;
+    }
+    double menuTop() const { return panelKind == PanelKind::Settings ? 138 : 16; }
+    double menuBottom() const { return popupHeight() - (panelKind == PanelKind::Settings ? 60 : 16); }
+    std::wstring commandLabel(int command, const wchar_t *label) const {
+        const auto chord = shortcuts.forCommand(command);
+        return std::wstring(label) + (chord.key ? L"\t" + chordLabel(chord) : L"");
+    }
+    void buildSettings() {
+        menuRows.clear();
+        menuScroll = 0;
+        menuHover = menuFocus = -1;
+        auto heading = [&](const wchar_t *label) { menuRows.push_back({0, label, L"", false, false, true}); };
+        auto row = [&](int command, const wchar_t *label, const wchar_t *detail, bool checked = false) {
+            menuRows.push_back({command, label, detail, true, checked});
+        };
+        if (settingsTab == 0) {
+            heading(L"阅读与布局");
+            row(7, L"左手模式", L"将工具栏放到左侧", leftHand);
+            row(8, L"阅读调暗", L"降低阅读区域亮度，保留 PDF 原始颜色", dark);
+            row(12, L"允许拖动工具栏", L"通过工具栏顶部的拖动区域调整位置", toolbarDraggable);
+            row(13, L"重置工具栏位置", L"回到当前惯用手一侧的默认位置");
+            heading(L"本地数据");
+            row(80, L"打开个人数据目录", L"设置、最近文件、阅读位置、恢复记录与日志");
+            heading(L"输入诊断");
+            row(17, L"笔输入诊断", L"记录笔侧键及输入来源，供排查设备问题", diagnostics.active());
+            row(18, L"打开诊断目录", L"查看输入日志与运行日志");
+        } else if (settingsTab == 1) {
+            heading(L"点击一项，然后按下新的快捷键");
+            for (size_t i = 0; i < shortcutDefinitions.size(); ++i)
+                row(100 + int(i), shortcutDefinitions[i].label, L" ");
+            row(81, L"恢复默认快捷键", L"只重置此页的按键，不影响其他设置");
+        } else {
+            heading(L"InkHorn");
+            row(0, L"当前版本", INKHORN_VERSION, false);
+            menuRows.back().enabled = false;
+            heading(L"使用说明");
+            row(0, L"工具参数", L"再次点击已选工具，可调整颜色、线宽与形状");
+            menuRows.back().enabled = false;
+            row(0, L"阅读与搜索", L"指针拖选单页正文；在空白处拖动可平移页面");
+            menuRows.back().enabled = false;
+            row(0, L"移动页面与缩放", L"空格 / 中键拖动 · Shift+滚轮横移 · Ctrl / Alt+滚轮缩放");
+            menuRows.back().enabled = false;
+            row(0, L"保存与分享", L"笔迹写入 PDF；后台恢复记录不能代替主动保存");
+            menuRows.back().enabled = false;
+            row(0, L"便携数据", L"迁移个人状态时，将 InkHorn-data 与 EXE 一起复制");
+            menuRows.back().enabled = false;
+            heading(L"开源许可");
+            row(10, L"第三方许可", L"查看程序内嵌的 PDFium 及其依赖的完整许可");
+        }
+        for (size_t i = 0; i < menuRows.size(); ++i)
+            if (menuRows[i].enabled && !menuRows[i].heading) {
+                menuFocus = int(i);
+                break;
+            }
+    }
+    void savePreferences() {
+        // All windows share the same portable preferences. Prevent a stale window from
+        // writing old shortcuts back on close, without reloading tools or document state.
+        for (auto *other : windows) {
+            if (other == this) continue;
+            other->shortcuts = shortcuts;
+            other->dark = dark;
+            other->leftHand = leftHand;
+            other->toolbarDraggable = toolbarDraggable;
+            other->toolbarMoved = toolbarMoved;
+            other->toolbarAnchorX = toolbarAnchorX;
+            other->toolbarAnchorY = toolbarAnchorY;
+            other->layout();
+            if (other->panel && other->panelKind == PanelKind::Settings) {
+                other->recordingShortcut = -1;
+                other->settingsFeedback = L"设置已在其他窗口更新";
+                other->buildSettings();
+                InvalidateRect(other->panel, nullptr, FALSE);
+            }
+        }
+        persistSettings();
+        layout();
+    }
+    bool recordShortcut(KeyChord chord) {
+        if (recordingShortcut < 0) return false;
+        if (chord.key == VK_ESCAPE) {
+            recordingShortcut = -1;
+            settingsFeedback = L"已取消，原快捷键保持不变";
+        } else if (chord.key != VK_CONTROL && chord.key != VK_SHIFT && chord.key != VK_MENU &&
+                   chord.key != VK_LWIN && chord.key != VK_RWIN) {
+            if (chord.key == VK_BACK) chord = {};
+            const auto index = size_t(recordingShortcut);
+            if (!Shortcuts::valid(chord))
+                settingsFeedback = L"使用字母、数字、F 键或 Delete，可搭配 Ctrl / Shift；F3 已保留";
+            else if (const int conflict = shortcuts.conflict(index, chord); conflict >= 0)
+                settingsFeedback = L"此按键已用于「" + std::wstring(shortcutDefinitions[size_t(conflict)].label) + L"」，请换一个";
+            else if (shortcuts.assign(index, chord)) {
+                settingsFeedback = std::wstring(shortcutDefinitions[index].label) + L"：" + chordLabel(chord);
+                recordingShortcut = -1;
+                savePreferences();
+            }
+        }
+        if (panel) InvalidateRect(panel, nullptr, FALSE);
+        return true;
+    }
+    void settingsCommand(int command) {
+        recordingShortcut = -1;
+        if (command >= 100 && command < 100 + int(shortcutDefinitions.size())) {
+            recordingShortcut = command - 100;
+            settingsFeedback = L"请按新的快捷键；Esc 取消，Backspace 清除";
+        } else if (command == 7 || command == 8 || command == 12 || command == 13) {
+            if (command == 7) { leftHand = !leftHand; toolbarMoved = false; }
+            if (command == 8) dark = !dark;
+            if (command == 12) { toolbarDraggable = !toolbarDraggable; panelScroll = 0; }
+            if (command == 13) toolbarMoved = false;
+            savePreferences();
+            for (auto &row : menuRows) {
+                if (row.command == 7) row.checked = leftHand;
+                if (row.command == 8) row.checked = dark;
+                if (row.command == 12) row.checked = toolbarDraggable;
+            }
+            settingsFeedback = L"已保存，立即生效";
+        } else if (command == 81) {
+            shortcuts.reset();
+            savePreferences();
+            settingsFeedback = L"已恢复默认快捷键";
+        } else if (command == 80) {
+            const auto directory = portableDataDirectory();
+            std::error_code error;
+            std::filesystem::create_directories(directory, error);
+            if (error || reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+                settingsFeedback = L"无法打开个人数据目录，请检查目录权限";
+        } else if (command == 17) {
+            toggleDiagnostics();
+            for (auto &row : menuRows)
+                if (row.command == 17) row.checked = diagnostics.active();
+        } else if (command == 18) openDiagnosticDirectory();
+        else if (command == 10) runCommand(10);
+        if (panel) InvalidateRect(panel, nullptr, FALSE);
+    }
+    bool settingsTouchInput(UINT message, UINT id, double x, double y) {
+        if (panelKind != PanelKind::Settings) return false;
+        if (message == WM_POINTERDOWN && y >= menuTop() && y <= menuBottom()) {
+            settingsTouch = id;
+            settingsTouchY = y;
+            settingsTouchScroll = menuScroll;
+            settingsTouchRow = menuHit(x, y);
+            settingsTouchMoved = false;
+            return true;
+        }
+        if (!settingsTouch || settingsTouch != id) return false;
+        if (std::abs(y - settingsTouchY) > 6) settingsTouchMoved = true;
+        if (settingsTouchMoved)
+            popupMenuScroll(settingsTouchScroll + settingsTouchY - y - menuScroll);
+        if (message == WM_POINTERUP) {
+            settingsTouch = 0;
+            if (!settingsTouchMoved && settingsTouchRow >= 0 && settingsTouchRow == menuHit(x, y))
+                panelInput(x, y);
+        }
+        return true;
+    }
+    bool savePanelSample(const wchar_t *path) {
+        paintPanel();
+        DIBSECTION bitmap{};
+        if (!popupBitmap || !GetObjectW(popupBitmap, sizeof(bitmap), &bitmap) || !bitmap.dsBm.bmBits)
+            return false;
+        ComPtr<IWICImagingFactory> wic;
+        ComPtr<IWICBitmap> pixels;
+        ComPtr<IWICStream> stream;
+        ComPtr<IWICBitmapEncoder> encoder;
+        ComPtr<IWICBitmapFrameEncode> frame;
+        const UINT width = UINT(bitmap.dsBm.bmWidth), height = UINT(std::abs(bitmap.dsBm.bmHeight));
+        const UINT stride = UINT(bitmap.dsBm.bmWidthBytes);
+        WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
+        return SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+               SUCCEEDED(wic->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppPBGRA, stride,
+                                                    stride * height, static_cast<BYTE *>(bitmap.dsBm.bmBits), &pixels)) &&
+               SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(path, GENERIC_WRITE)) &&
+               SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+               SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+               SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+               SUCCEEDED(frame->SetSize(width, height)) && SUCCEEDED(frame->SetPixelFormat(&pixelFormat)) &&
+               SUCCEEDED(frame->WriteSource(pixels.Get(), nullptr)) && SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+    }
+    bool settingsCheck() {
+        std::ofstream report("settings-check-results.txt");
+        report << std::unitbuf;
+        const auto original = settingsText();
+        const auto history = doc() ? doc()->history.fingerprint() : std::string{};
+        functionsMenu();
+        bool ok = std::none_of(menuRows.begin(), menuRows.end(), [](const auto &row) {
+            return row.command == 7 || row.command == 8 || row.command == 10 ||
+                   row.command == 12 || row.command == 13 || row.command == 17 || row.command == 18;
+        });
+        runCommand(9);
+        ok = ok && panel && panelKind == PanelKind::Settings && menuHit(30, 100) == -1;
+        ok = savePanelSample(L"settings-general.png") && ok;
+        report << "open-and-render: " << ok << '\n';
+        const auto handle = panel;
+        settingsCommand(7);
+        settingsCommand(8);
+        settingsCommand(12);
+        ok = ok && panel == handle && leftHand && dark && toolbarDraggable;
+        // Settings and legacy base preferences roundtrip without touching personal storage.
+        App restored;
+        restored.parseSettings(settingsText());
+        ok = ok && restored.leftHand && restored.dark && restored.toolbarDraggable;
+        report << "toggle-and-roundtrip: " << ok << '\n';
+        popupKey(VK_RIGHT);
+        ok = ok && settingsTab == 1 && menuScroll == 0;
+        ok = savePanelSample(L"settings-shortcuts.png") && ok;
+        settingsCommand(100); // Open PDF: conflict, cancellation, then successful reassignment.
+        recordShortcut({'S', 1});
+        ok = ok && recordingShortcut == 0 && shortcuts.match({'O', 1}) == 1 && !settingsFeedback.empty();
+        popupKey(VK_ESCAPE);
+        ok = ok && panel && recordingShortcut == -1 && shortcuts.match({'O', 1}) == 1;
+        settingsCommand(100);
+        recordShortcut({'Q', 1});
+        restored.parseSettings(settingsText());
+        ok = ok && shortcuts.match({'Q', 1}) == 1 && !shortcuts.match({'O', 1}) && restored.shortcuts.match({'Q', 1}) == 1;
+        settingsCommand(100);
+        popupKey(VK_BACK);
+        ok = ok && !shortcuts.forCommand(1).key && !shortcuts.match({'Q', 1});
+        settingsCommand(81);
+        ok = ok && shortcuts.match({'O', 1}) == 1;
+        report << "shortcut-edit-and-reset: " << ok << '\n';
+        popupMenuScroll(1e6);
+        ok = ok && menuScroll > 0 && menuHit(40, menuTop() - 1) == -1 && menuHit(40, menuBottom() + 1) == -1;
+        popupKey(VK_DOWN);
+        ok = ok && menuScroll == 86 && menuFocus == 2;
+        report << "scroll-and-navigation: " << ok << '\n';
+        const double touchStart = menuTop() + 60;
+        settingsTouchInput(WM_POINTERDOWN, 99, 40, touchStart);
+        settingsTouchInput(WM_POINTERUPDATE, 99, 40, touchStart - 70);
+        settingsTouchInput(WM_POINTERUP, 99, 40, touchStart - 70);
+        ok = ok && menuScroll == 156 && recordingShortcut == -1 && !settingsTouch;
+        popupKey(VK_RIGHT);
+        ok = ok && settingsTab == 2 && menuScroll == 0;
+        ok = savePanelSample(L"settings-about.png") && ok;
+        popupKey(VK_ESCAPE);
+        ok = ok && !panel;
+        // A former tool key must stop working after reassignment; modified letters must not leak to tools.
+        size_t penIndex = 0;
+        while (shortcutDefinitions[penIndex].command != 31) ++penIndex;
+        shortcuts.assign(penIndex, {'Q', 0});
+        tool = 0;
+        SendMessageW(window, WM_KEYDOWN, '2', 0);
+        ok = ok && tool == 0;
+        SendMessageW(window, WM_KEYDOWN, 'Q', 0);
+        ok = ok && tool == 1;
+        shortcuts.assign(penIndex, {VK_F10, 0});
+        tool = 0;
+        SendMessageW(window, WM_SYSKEYDOWN, VK_F10, 0);
+        ok = ok && tool == 1;
+        report << "command-routing: " << ok << '\n';
+        const auto extension = original.find(" PBKEY1");
+        App legacy;
+        legacy.parseSettings(original.substr(0, extension));
+        ok = ok && legacy.shortcuts.match({'O', 1}) == 1 &&
+             std::equal(legacy.colors.begin(), legacy.colors.end(), colors.begin(), [](Color a, Color b) {
+                 return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+             });
+        parseSettings(original);
+        const auto legacyUi = original.find(" PBUI2");
+        legacy.parseSettings(original.substr(0, legacyUi));
+        ok = ok && legacy.widths == widths;
+        report << "legacy-settings: " << ok << '\n';
+        RECT bounds{};
+        GetWindowRect(window, &bounds);
+        SetWindowPos(window, nullptr, 0, 0, LONG(680 * dpi()), LONG(420 * dpi()), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        runCommand(9);
+        ok = ok && popupWidth() <= width() && popupHeight() <= height() && menuBottom() > menuTop();
+        ok = savePanelSample(L"settings-compact.png") && ok;
+        panelInput(popupWidth() - 50, 40);
+        ok = ok && !panel;
+        report << "compact-layout: " << ok << '\n';
+        SetWindowPos(window, nullptr, 0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return ok && (!doc() || doc()->history.fingerprint() == history);
+    }
     double menuRowHeight(const MenuRow &row) const {
         return row.heading ? 28 : (!row.detail.empty() ? 58 : 36);
     }
@@ -2510,9 +3214,9 @@ struct App {
         return height;
     }
     int menuHit(double x, double y) const {
-        if (x < 16 || x > popupWidth() - 16 || y < 16 || y > popupHeight() - 16)
+        if (x < 16 || x > popupWidth() - 16 || y < menuTop() || y > menuBottom())
             return -1;
-        double top = 16 - menuScroll;
+        double top = menuTop() - menuScroll;
         for (size_t i = 0; i < menuRows.size(); ++i) {
             const auto &row = menuRows[i];
             if (y >= top && y < top + menuRowHeight(row))
@@ -2561,30 +3265,22 @@ struct App {
         } else {
             const bool ready = doc() && !doc()->loading;
             heading(L"文件");
-            item(1, L"打开 PDF…\tCtrl+O");
-            item(14, L"保存\tCtrl+S", ready);
-            item(3, L"另存为…\tCtrl+Shift+S", ready);
-            item(2, L"关闭文件\tCtrl+W", ready);
+            item(1, commandLabel(1, L"打开 PDF…").c_str());
+            item(14, commandLabel(14, L"保存").c_str(), ready);
+            item(3, commandLabel(3, L"另存为…").c_str(), ready);
+            item(2, commandLabel(2, L"关闭文件").c_str(), ready);
             heading(L"编辑");
-            item(15, L"撤销\tCtrl+Z", ready && doc()->history.cursor > 0);
-            item(16, L"重做\tCtrl+Y", ready && doc()->history.cursor + 1 < doc()->history.states.size());
-            item(11, L"删除所选笔记\tDelete", ready && selected.has_value());
-            item(20, L"复制所选文字\tCtrl+C", ready && doc()->selectionPage >= 0);
+            item(15, commandLabel(15, L"撤销").c_str(), ready && doc()->history.cursor > 0);
+            item(16, commandLabel(16, L"重做").c_str(), ready && doc()->history.cursor + 1 < doc()->history.states.size());
+            item(11, commandLabel(11, L"删除所选笔记").c_str(), ready && selected.has_value());
+            item(20, commandLabel(20, L"复制所选文字").c_str(), ready && doc()->selectionPage >= 0);
             heading(L"阅读与显示");
-            item(19, L"在文档中查找\tCtrl+F", ready);
-            item(4, L"适合宽度", ready);
-            item(5, L"隐藏笔记", ready, ready && doc()->hidden);
-            item(6, L"全屏\tF11", true, fullscreen);
-            item(8, L"阅读调暗", true, dark);
-            heading(L"工具栏");
-            item(7, L"左手模式", true, leftHand);
-            item(12, L"允许拖动", true, toolbarDraggable);
-            item(13, L"重置位置");
-            heading(L"帮助");
-            item(9, L"设置与说明");
-            item(10, L"第三方许可");
-            item(17, L"笔输入诊断\tCtrl+Shift+D", true, diagnostics.active());
-            item(18, L"打开诊断目录\tCtrl+Shift+L");
+            item(19, commandLabel(19, L"在文档中查找").c_str(), ready);
+            item(4, commandLabel(4, L"适合宽度").c_str(), ready);
+            item(5, commandLabel(5, L"隐藏笔记").c_str(), ready, ready && doc()->hidden);
+            item(6, commandLabel(6, L"全屏").c_str(), true, fullscreen);
+            heading(L"偏好");
+            item(9, commandLabel(9, L"设置…").c_str());
         }
         for (size_t i = 0; i < menuRows.size(); ++i)
             if (menuRows[i].enabled && !menuRows[i].heading) {
@@ -2594,6 +3290,7 @@ struct App {
     }
     void paintMenu(ID2D1RenderTarget *rt, ID2D1SolidColorBrush *b) {
         const float w = float(popupWidth()), h = float(popupHeight());
+        const bool settings = panelKind == PanelKind::Settings;
         auto set = [&](Color c) {
             b->SetColor(D2D1::ColorF(c.r / 255.f, c.g / 255.f, c.b / 255.f, c.a / 255.f));
         };
@@ -2602,29 +3299,72 @@ struct App {
             rt->DrawTextW(label.c_str(), UINT32(label.size()), compact ? smallFormat.Get() : format.Get(),
                           box, b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         };
-        rt->PushAxisAlignedClip(D2D1::RectF(16, 16, w - 16, h - 16), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        float y = float(16 - menuScroll);
+        if (settings) {
+            text(L"设置", D2D1::RectF(30, 27, w - 100, 53), Theme::text);
+            set(Theme::inset);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(w - 76, 24, w - 24, 56), 10, 10), b);
+            text(L"关闭", D2D1::RectF(w - 64, 31, w - 28, 54), Theme::text, true);
+            const wchar_t *tabs[] = {L"常规", L"快捷键", L"关于与说明"};
+            for (int tab = 0; tab < 3; ++tab) {
+                const float x = 24.f + tab * 142;
+                if (tab == settingsTab) {
+                    set({230, 237, 250, 255});
+                    rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, 92, x + 134, 128), 11, 11), b);
+                }
+                text(tabs[tab], D2D1::RectF(x + 16, 101, x + 130, 124),
+                     tab == settingsTab ? Theme::accent : Theme::muted);
+            }
+            const std::wstring hint = !settingsFeedback.empty() ? settingsFeedback :
+                (settingsTab == 1 ? L"Esc 取消录入 · Backspace 清除 · F3 / Esc 与文本编辑按键保留各自用途" :
+                                   L"更改自动保存 · ← → 切换分类 · ↑ ↓ 选择 · Enter 操作 · Esc 关闭");
+            text(hint, D2D1::RectF(30, h - 46, w - 30, h - 18), Theme::muted, true);
+        }
+        rt->PushAxisAlignedClip(D2D1::RectF(16, float(menuTop()), w - 16, float(menuBottom())), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        float y = float(menuTop() - menuScroll);
         for (size_t i = 0; i < menuRows.size(); ++i) {
             const auto &row = menuRows[i];
             const float rowHeight = float(menuRowHeight(row));
-            if (y + rowHeight >= 16 && y < h - 16) {
+            if (y + rowHeight >= menuTop() && y < menuBottom()) {
                 if (!row.heading && (int(i) == menuHover || row.checked)) {
                     set(row.checked ? Color{230, 237, 250, 255} : Theme::inset);
                     rt->FillRoundedRectangle(
                         D2D1::RoundedRect(D2D1::RectF(17, y + 2, w - 17, y + rowHeight - 2), 10, 10), b);
+                }
+                if (settings && int(i) == menuFocus && row.enabled) {
+                    set(Theme::accent);
+                    rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(18, y + 3, w - 18, y + rowHeight - 3), 10, 10), b, 1);
                 }
                 const auto tone = row.heading || !row.enabled ? Theme::muted : Theme::text;
                 if (row.heading)
                     text(row.label, D2D1::RectF(28, y + 7, w - 28, y + rowHeight), tone, true);
                 else {
                     const size_t tab = row.label.find(L'\t');
+                    const bool binding = settings && row.command >= 100 && row.command < 100 + int(shortcutDefinitions.size());
+                    const bool toggle = settings && (row.command == 7 || row.command == 8 || row.command == 12 || row.command == 17);
                     text(row.label.substr(0, tab),
-                         D2D1::RectF(30, y + 9, w - (tab == std::wstring::npos ? 30 : 112), y + 33), tone);
+                         D2D1::RectF(30, y + (binding ? 20 : 9), w - (binding ? 220 : (toggle ? 92 : (tab == std::wstring::npos ? 30 : 140))), y + (binding ? 46 : 33)),
+                         settings && !row.enabled ? Theme::text : tone);
                     if (tab != std::wstring::npos)
-                        text(row.label.substr(tab + 1), D2D1::RectF(w - 110, y + 10, w - 26, y + 33),
+                        text(row.label.substr(tab + 1), D2D1::RectF(w - 138, y + 10, w - 26, y + 33),
                              Theme::muted, true);
-                    if (!row.detail.empty())
-                        text(row.detail, D2D1::RectF(30, y + 32, w - 30, y + 54), Theme::muted, true);
+                    if (!row.detail.empty() && !binding)
+                        text(row.detail, D2D1::RectF(30, y + 32, w - (toggle ? 92 : 30), y + 54), Theme::muted, true);
+                    if (binding) {
+                        const auto index = size_t(row.command - 100);
+                        const bool recording = recordingShortcut == int(index);
+                        set(recording ? Color{230, 237, 250, 255} : Theme::inset);
+                        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(w - 210, y + 10, w - 30, y + 48), 10, 10), b);
+                        text(recording ? L"请按快捷键…" : chordLabel(shortcuts.at(index)),
+                             D2D1::RectF(w - 196, y + 22, w - 36, y + 45), recording ? Theme::accent : Theme::text, true);
+                    }
+                    if (toggle) {
+                        set(row.checked ? Theme::accent : Color{199, 207, 221, 255});
+                        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(w - 78, y + 17, w - 34, y + 41), 12, 12), b);
+                        set({255, 255, 255, 255});
+                        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(w - (row.checked ? 46 : 66), y + 29), 9, 9), b);
+                    } else if (settings && row.enabled && !binding) {
+                        text(L"›", D2D1::RectF(w - 44, y + 9, w - 28, y + 32), Theme::muted);
+                    }
                     if (row.checked) {
                         set(Theme::accent);
                         rt->FillRoundedRectangle(
@@ -2641,17 +3381,18 @@ struct App {
             rt->DrawLine(D2D1::Point2F(30, insertionY), D2D1::Point2F(w - 30, insertionY), b, 2);
         }
         rt->PopAxisAlignedClip();
-        const double overflow = menuHeight() - (popupHeight() - 32);
+        const double visible = menuBottom() - menuTop();
+        const double overflow = menuHeight() - visible;
         if (overflow > 0) {
-            const float track = h - 40, thumb = std::max(24.f, float(track * (h - 32) / menuHeight()));
-            const float top = 20 + float(menuScroll / overflow) * (track - thumb);
+            const float track = float(visible - 8), thumb = std::max(24.f, float(track * visible / menuHeight()));
+            const float top = float(menuTop() + 4) + float(menuScroll / overflow) * (track - thumb);
             set({195, 205, 222, 255});
             rt->FillRoundedRectangle(
                 D2D1::RoundedRect(D2D1::RectF(w - 14, top, w - 11, top + thumb), 1.5f, 1.5f), b);
         }
     }
     void popupMenuScroll(double delta) {
-        menuScroll = std::clamp(menuScroll + delta, 0.0, std::max(0.0, menuHeight() - (popupHeight() - 32)));
+        menuScroll = std::clamp(menuScroll + delta, 0.0, std::max(0.0, menuHeight() - (menuBottom() - menuTop())));
         menuHover = -1;
         if (mergeSource && panel) {
             POINT screen{};
@@ -2664,7 +3405,8 @@ struct App {
             InvalidateRect(panel, nullptr, FALSE);
     }
     void runCommand(int command) {
-        closePanel();
+        if (!(command == 10 && panel && panelKind == PanelKind::Settings))
+            closePanel();
         if (command >= 1000) {
             activate(command - 1000);
             return;
@@ -2703,7 +3445,9 @@ struct App {
             invalidate();
             break;
         case 9:
-            openPopup(PanelKind::About);
+            settingsTab = 0;
+            settingsFeedback.clear();
+            openPopup(PanelKind::Settings);
             break;
         case 10: {
             auto resource = FindResourceW(instance, MAKEINTRESOURCEW(200), RT_RCDATA);
@@ -2760,7 +3504,45 @@ struct App {
         case 20:
             copyText();
             break;
+        case 21:
+            if (doc() && !doc()->loading) {
+                SetFocus(pageEdit);
+                SendMessageW(pageEdit, EM_SETSEL, 0, -1);
+            }
+            break;
+        case 22:
+        case 23:
+            if (!sessions.empty())
+                activate((active + int(sessions.size()) + (command == 23 ? -1 : 1)) % int(sessions.size()));
+            break;
+        case 24:
+            undo(true);
+            break;
+        default:
+            if (command >= 30 && command <= 35) {
+                finishGesture();
+                tool = command - 30;
+                selected.reset();
+                invalidate();
+            }
+            break;
         }
+    }
+    static KeyChord pressedChord(WPARAM key) {
+        return {unsigned(key), (GetKeyState(VK_CONTROL) < 0 ? 1u : 0u) |
+                                   (GetKeyState(VK_SHIFT) < 0 ? 2u : 0u)};
+    }
+    bool shortcutKey(WPARAM key, bool textInput = false) {
+        if (GetKeyState(VK_MENU) < 0 || GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0)
+            return false;
+        const auto chord = pressedChord(key);
+        const int command = shortcuts.match(chord);
+        // Native edit controls retain copy/paste, selection, typing and search navigation.
+        if (!command || (textInput && (!(chord.modifiers & 1) || (command != 9 && command != 19) ||
+                                      key == 'A' || key == 'C' || key == 'V' || key == 'X' || key == 'Z' || key == 'Y')))
+            return false;
+        runCommand(command);
+        return true;
     }
     void toggleFullscreen() {
         finishGesture();
@@ -2768,7 +3550,7 @@ struct App {
         if (fullscreen) {
             placement.length = sizeof(placement);
             GetWindowPlacement(window, &placement);
-            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
+            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_HSCROLL);
             MONITORINFO m{};
             m.cbSize = sizeof(m);
             GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &m);
@@ -2777,7 +3559,7 @@ struct App {
                          SWP_FRAMECHANGED | SWP_NOZORDER);
             showHeader = false;
         } else {
-            SetWindowLongPtrW(window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN);
+            SetWindowLongPtrW(window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN | WS_HSCROLL);
             SetWindowPlacement(window, &placement);
             SetWindowPos(window, nullptr, 0, 0, 0, 0,
                          SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
@@ -2798,7 +3580,7 @@ struct App {
             invalidate();
         }
     }
-    void setScale(double scale) {
+    void setScale(double scale, std::optional<Point> anchor = {}) {
         RuntimeStage stage(RuntimeThread::Ui, "ui.zoom");
         stopInertia();
         if (auto *s = doc(); s && !s->loading) {
@@ -2807,8 +3589,14 @@ struct App {
                 return;
             finishGesture();
             double ratio = std::clamp(scale, .1, 4.0) / s->scale;
-            s->scroll = (s->scroll + bodyHeight() / 2) * ratio - bodyHeight() / 2;
+            const double available = width() - 148;
+            const double pageWidth = s->pages.empty() ? 595 : s->pages[size_t(s->page)].w;
+            const double focusX = anchor ? anchor->x - paperLeft() : available / 2;
+            const double focusY = anchor ? anchor->y - header() : bodyHeight() / 2;
+            const double centerX = s->horizontal + focusX - std::max(0.0, (available - pageWidth * s->scale) / 2);
+            s->scroll = (s->scroll + focusY) * ratio - focusY;
             s->scale = std::clamp(scale, .1, 4.0);
+            s->horizontal = centerX * ratio + std::max(0.0, (available - pageWidth * s->scale) / 2) - focusX;
             s->fit = false;
             engine->cancelRender(s->id);
             s->pending = -1;
@@ -2874,7 +3662,7 @@ struct App {
             ++eraseRevision;
     }
     void down(double x, double y, bool barrel = false, double pressure = .5, bool pressureValid = false,
-              double sampleTime = inputTime()) {
+              double sampleTime = inputTime(), bool panRequested = false, bool preciseRequested = false) {
         RuntimeStage stage(RuntimeThread::Ui, "ui.ink-down");
         stopInertia();
         if (closePrompt) {
@@ -2967,13 +3755,17 @@ struct App {
             return;
         if (s->closing)
             return;
+        if (panRequested || spacePanHeld) {
+            beginPan(x, y, preciseRequested);
+            invalidate();
+            return;
+        }
         int page = pageAt(x, y);
         lastScreen = {x, y, 0};
         startScroll = s->scroll;
         startHorizontal = s->horizontal;
-        horizontalPan = false;
         if (page < 0) {
-            beginPan(x, y, false);
+            beginPan(x, y, false, true);
             return;
         }
         gesturePage = page;
@@ -3010,7 +3802,7 @@ struct App {
                 }
             }
             if (!selected && gesture != Gesture::Text)
-                beginPan(x, y, false);
+                beginPan(x, y);
             invalidate();
             return;
         }
@@ -3043,11 +3835,20 @@ struct App {
         if (!s)
             return;
         if (gesture == Gesture::Pan) {
-            s->scroll = startScroll - (y - lastScreen.y);
-            if (horizontalPan)
-                s->horizontal = startHorizontal - (x - lastScreen.x);
+            if (preciseContactPan) {
+                const auto movement = contactPanAxis.step(x - precisePanPoint.x, y - precisePanPoint.y, sampleTime);
+                precisePanPoint = {x, y, 0};
+                s->scroll -= movement.y;
+                s->horizontal -= movement.x;
+            } else {
+                s->scroll = startScroll - (y - lastScreen.y);
+                if (!verticalContactPan) s->horizontal = startHorizontal - (x - lastScreen.x);
+            }
             clampScroll();
-            momentum.sample(s->scroll, sampleTime);
+            if (!preciseContactPan) {
+                momentum.sample(s->scroll, sampleTime);
+                if (!verticalContactPan) horizontalMomentum.sample(s->horizontal, sampleTime);
+            }
             requestPage();
             invalidate();
             return;
@@ -3096,10 +3897,15 @@ struct App {
         RuntimeStage stage(RuntimeThread::Ui, "ui.ink-commit");
         auto *s = doc();
         const auto completed = gesture;
-        if (completed == Gesture::Pan && release && momentum.release(inputTime()))
-            SetTimer(window, 2, 16, nullptr);
-        else if (completed == Gesture::Pan)
-            stopInertia();
+        if (completed == Gesture::Pan) {
+            const double now = inputTime();
+            const bool verticalCoast = release && !preciseContactPan && momentum.release(now);
+            const bool horizontalCoast = release && !preciseContactPan && !verticalContactPan && horizontalMomentum.release(now);
+            if (verticalCoast || horizontalCoast)
+                SetTimer(window, 2, 16, nullptr);
+            else
+                stopInertia();
+        }
         if (completed == Gesture::Toolbar) {
             persistSettings();
             updateTooltips();
@@ -3122,6 +3928,11 @@ struct App {
         }
         gesture = Gesture::None;
         gesturePage = -1;
+        preciseContactPan = false;
+        verticalContactPan = false;
+        contactPanAxis.reset();
+        if (s && completed == Gesture::Pan && !scrolling())
+            rememberView();
         if (s && (completed == Gesture::Draw || completed == Gesture::Move || completed == Gesture::Erase))
             recoverLater(*s);
         liveValid = false;
@@ -3144,7 +3955,10 @@ struct App {
     }
     void penInput(UINT message, const POINTER_PEN_INFO &info,
                   std::span<const POINTER_PEN_INFO> history = {}) {
-        if (mouseContact && message != WM_POINTERDOWN)
+        lastPenInput = inputTime();
+        if (message == WM_POINTERENTER || message == WM_POINTERDOWN || message == WM_POINTERUP)
+            endDriverPan();
+        if (mouseContact && (middlePan || message != WM_POINTERDOWN))
             return;
         if (message != WM_POINTERLEAVE && !(info.pointerInfo.pointerFlags & POINTER_FLAG_CANCELED))
             usePenInput();
@@ -3154,7 +3968,8 @@ struct App {
         const bool owned = penContact.owns(id);
         penScreen = pointer.ptPixelLocation;
         penPositionKnown = true;
-        penTemporaryEraser = penEraser(info.penFlags);
+        const bool panRequested = spacePanHeld || (pointer.pointerFlags & POINTER_FLAG_THIRDBUTTON) != 0;
+        penTemporaryEraser = !panRequested && penEraser(info.penFlags);
         penNear = (pointer.pointerFlags & POINTER_FLAG_INRANGE) != 0;
         penCoordinates.refresh(pointer.sourceDevice, message == WM_POINTERDOWN || message == WM_POINTERENTER);
         POINT origin{};
@@ -3193,8 +4008,8 @@ struct App {
             mouseContact = false;
             if (!contact)
                 return;
-            SetFocus(window);
-            down(x, y, penTemporaryEraser, info.pressure / 1024.0, pressureValid, pointerSampleTime(pointer));
+            if (!smoke) SetFocus(window);
+            down(x, y, penTemporaryEraser, info.pressure / 1024.0, pressureValid, pointerSampleTime(pointer), panRequested, panRequested);
             // Closing a popup can dispatch capture changes synchronously. Arm only AFTER it closes.
             if (gesture != Gesture::None) {
                 activePointer = id;
@@ -3216,6 +4031,10 @@ struct App {
                 penContact.end();
                 activePointer = 0;
             } else {
+                if (panRequested && gesture != Gesture::Pan && gesture != Gesture::Toolbar) {
+                    finishGesture();
+                    beginPan(x, y, true);
+                }
                 const bool shouldErase = tool == 3 || penTemporaryEraser;
                 if ((gesture == Gesture::Draw || gesture == Gesture::Erase) &&
                     shouldErase != (gesture == Gesture::Erase)) {
@@ -3665,8 +4484,13 @@ struct App {
     }
     void cancelGesture() {
         stopInertia();
+        endDriverPan();
+        preciseContactPan = false;
+        verticalContactPan = false;
+        contactPanAxis.reset();
         penContact.end();
         mouseContact = false;
+        middlePan = false;
         activePointer = 0;
         gesture = Gesture::None;
         gesturePage = -1;
@@ -3685,12 +4509,17 @@ struct App {
             invalidate();
         }
     }
-    void scroll(double delta, double x, double y, double time = inputTime()) {
+    void scroll(double delta, double x, double y, double time = inputTime(),
+                bool horizontalMessage = false, bool control = false, bool alt = false, bool shift = false,
+                bool precise = false) {
         if (closePrompt) {
             stopInertia();
             return;
         }
-        if (toolbarContains(x, y)) {
+        if (!std::isfinite(delta) || delta == 0 || gesture != Gesture::None || y < header())
+            return;
+        const auto action = wheelAction(horizontalMessage, control, alt, shift);
+        if (toolbarContains(x, y) && action == WheelAction::Vertical) {
             stopInertia();
             auto r = toolbar();
             panelScroll = std::clamp(panelScroll - delta * 36, 0.0,
@@ -3699,20 +4528,124 @@ struct App {
             invalidate();
             return;
         }
-        if (GetKeyState(VK_CONTROL) < 0) {
+        if (action == WheelAction::Zoom) {
+            endDriverPan();
             stopInertia();
-            if (doc())
-                setScale(doc()->scale * (delta > 0 ? 1.1 : 1 / 1.1));
+            if (doc() && !doc()->loading) {
+                setScale(doc()->scale * std::pow(1.1, std::clamp(delta, -24.0, 24.0)));
+                altWheelZoomed = alt;
+            }
             return;
         }
         if (auto *s = doc(); s && !s->loading && gesture == Gesture::None && delta != 0) {
-            const bool animating = momentum.active() || wheel.active();
+            if (precise) {
+                const double distance = (action == WheelAction::Horizontal && horizontalMessage ? delta : -delta) * 90;
+                if (action == WheelAction::Horizontal) driverHorizontalTarget.reset();
+                driverPan(action == WheelAction::Horizontal ? distance : 0,
+                          action == WheelAction::Vertical ? distance : 0, time);
+                return;
+            }
+            endDriverPan();
+            const bool animating = scrolling();
             momentum.stop();
-            wheel.add(-delta * 90, time);
+            horizontalMomentum.stop();
+            if (action == WheelAction::Horizontal)
+                horizontalWheel.add((horizontalMessage ? delta : -delta) * 90, time);
+            else
+                wheel.add(-delta * 90, time);
             // Repeated wheel messages must not reset the running timer and starve frames.
             if (!animating)
                 SetTimer(window, 2, 16, nullptr);
         }
+    }
+    bool legacyScroll(bool horizontal, WPARAM request, LPARAM control, double time = inputTime()) {
+        // Wacom/legacy gesture drivers can send scroll-bar commands without a visible scroll bar.
+        // Never treat a child scrollbar's notifications as canvas navigation.
+        if (control || !doc() || doc()->loading || closePrompt || panel || gesture != Gesture::None)
+            return false;
+        const unsigned command = LOWORD(request);
+        const bool precise = driverPanActive || recentPenInput(time);
+        double distance{};
+        const double viewport = horizontal ? width() - 148 : bodyHeight();
+        switch (command) {
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK: {
+            if (!horizontal) return false;
+            SCROLLINFO info{sizeof(info), SIF_TRACKPOS};
+            if (!GetScrollInfo(window, SB_HORZ, &info)) return false;
+            stopInertia();
+            const double position = (command == SB_THUMBTRACK ? info.nTrackPos : HIWORD(request)) / dpi();
+            if (precise) {
+                const double delta = position - driverHorizontalTarget.value_or(doc()->horizontal);
+                driverHorizontalTarget = position;
+                driverPan(delta, 0, time);
+                return true;
+            }
+            doc()->horizontal = position;
+            clampScroll();
+            rememberView();
+            requestPage();
+            invalidate();
+            return true;
+        }
+        case SB_LINELEFT: distance = precise ? -1 / dpi() : -36; break;
+        case SB_LINERIGHT: distance = precise ? 1 / dpi() : 36; break;
+        case SB_PAGELEFT: distance = -viewport * .9; break;
+        case SB_PAGERIGHT: distance = viewport * .9; break;
+        case SB_LEFT:
+        case SB_RIGHT: {
+            stopInertia();
+            auto &position = horizontal ? doc()->horizontal : doc()->scroll;
+            position = command == SB_LEFT ? 0 : 1e12;
+            clampScroll();
+            rememberView();
+            requestPage();
+            invalidate();
+            return true;
+        }
+        case SB_ENDSCROLL:
+            // Pen drivers may end each native scroll command while the same
+            // side-button drag continues. Release/pointer reentry ends its lock.
+            if (!precise) endDriverPan();
+            return true;
+        default:
+            return false;
+        }
+        if (precise) {
+            if (horizontal) driverHorizontalTarget.reset();
+            driverPan(horizontal ? distance : 0, horizontal ? 0 : distance, time);
+            return true;
+        }
+        const bool animating = scrolling();
+        momentum.stop();
+        horizontalMomentum.stop();
+        if (horizontal) horizontalWheel.add(distance, time);
+        else wheel.add(distance, time);
+        if (!animating) SetTimer(window, 2, 16, nullptr);
+        return true;
+    }
+    bool zoomGesture(const GESTUREINFO &info) {
+        if (info.dwID != GID_ZOOM) return false;
+        const auto distance = info.ullArguments;
+        if (!doc() || doc()->loading || closePrompt || panel || gesture != Gesture::None || !distance) {
+            pinchDistance = 0;
+            return true;
+        }
+        if ((info.dwFlags & GF_BEGIN) || !pinchDistance || info.dwInstanceID != pinchInstance) {
+            stopInertia();
+            pinchDistance = distance;
+            pinchInstance = info.dwInstanceID;
+        } else {
+            const double ratio = double(distance) / double(pinchDistance);
+            POINT center{info.ptsLocation.x, info.ptsLocation.y};
+            ScreenToClient(window, &center);
+            const Point anchor{center.x / dpi(), center.y / dpi(), 0};
+            if (anchor.x >= 0 && anchor.x <= width() && anchor.y >= header() && anchor.y <= height())
+                setScale(doc()->scale * ratio, anchor);
+            pinchDistance = distance;
+        }
+        if (info.dwFlags & GF_END) pinchDistance = 0;
+        return true;
     }
     void result(std::shared_ptr<Result> r) {
         RuntimeStage stage(RuntimeThread::Ui, "ui.pdf-result");
@@ -3872,6 +4805,8 @@ struct App {
         }
     }
     void closePanel() {
+        recordingShortcut = -1;
+        settingsTouch = 0;
         const bool saveSettings = panel && (panelKind == PanelKind::Tool || panelKind == PanelKind::Color);
         mergeSource = nullptr;
         mergeInsert = -1;
@@ -3907,13 +4842,15 @@ struct App {
         openPopup(PanelKind::Color);
     }
     double popupWidth() const {
+        if (panelKind == PanelKind::Settings)
+            return std::min(680.0, width() - 24);
         return panelKind == PanelKind::Tool
                    ? 232
                    : (panelKind == PanelKind::Files ? std::min(420.0, width() - 24) : 328);
     }
     double popupHeight() const {
-        if (panelKind == PanelKind::About)
-            return 284;
+        if (panelKind == PanelKind::Settings)
+            return std::min(650.0, height() - 24);
         if (panelKind == PanelKind::Color)
             return 320;
         if (panelKind == PanelKind::Functions || panelKind == PanelKind::Files)
@@ -4034,10 +4971,22 @@ struct App {
     bool popupKey(WPARAM key) {
         if (!panel || panelKind == PanelKind::Tool)
             return false;
-        if (panelKind == PanelKind::About) {
-            if (key == VK_ESCAPE || key == VK_RETURN)
-                closePanel();
-            return true;
+        if (panelKind == PanelKind::Settings) {
+            if (recordingShortcut >= 0 && (GetKeyState(VK_MENU) < 0 || GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0)) {
+                settingsFeedback = L"自定义按键请使用 Ctrl / Shift；Alt+滚轮用于缩放";
+                InvalidateRect(panel, nullptr, FALSE);
+                return true;
+            }
+            if (recordingShortcut >= 0)
+                return recordShortcut(pressedChord(key));
+            if (key == VK_LEFT || key == VK_RIGHT || key == VK_TAB) {
+                const int direction = key == VK_LEFT || (key == VK_TAB && GetKeyState(VK_SHIFT) < 0) ? -1 : 1;
+                settingsTab = (settingsTab + 3 + direction) % 3;
+                settingsFeedback.clear();
+                buildSettings();
+                InvalidateRect(panel, nullptr, FALSE);
+                return true;
+            }
         }
         if (panelKind == PanelKind::Color) {
             if (key == VK_ESCAPE)
@@ -4082,8 +5031,12 @@ struct App {
         }
         if (key == VK_RETURN) {
             if (menuFocus >= 0 && size_t(menuFocus) < menuRows.size() &&
-                menuRows[size_t(menuFocus)].enabled && !menuRows[size_t(menuFocus)].heading)
-                runCommand(menuRows[size_t(menuFocus)].command);
+                menuRows[size_t(menuFocus)].enabled && !menuRows[size_t(menuFocus)].heading) {
+                if (panelKind == PanelKind::Settings)
+                    settingsCommand(menuRows[size_t(menuFocus)].command);
+                else
+                    runCommand(menuRows[size_t(menuFocus)].command);
+            }
             return true;
         }
         if (key == VK_UP || key == VK_DOWN) {
@@ -4100,12 +5053,12 @@ struct App {
             const double bottom = top + menuRowHeight(menuRows[size_t(menuFocus)]);
             if (top < menuScroll)
                 menuScroll = top;
-            if (bottom > menuScroll + popupHeight() - 32)
-                menuScroll = bottom - (popupHeight() - 32);
+            if (bottom > menuScroll + menuBottom() - menuTop())
+                menuScroll = bottom - (menuBottom() - menuTop());
             InvalidateRect(panel, nullptr, FALSE);
             return true;
         }
-        return false;
+        return panelKind == PanelKind::Settings; // Settings consume keys instead of editing the document behind them.
     }
     D2D1_RECT_F popupTrack() const {
         return D2D1::RectF(176, 52, 188, tool == 5 ? 326.f : (tool == 3 ? 164.f : 230.f));
@@ -4124,9 +5077,25 @@ struct App {
         invalidate();
     }
     void panelInput(double x, double y, bool right = false) {
-        if (panelKind == PanelKind::About) {
-            if (x >= 24 && x <= 304 && y >= 220 && y <= 260)
+        if (panelKind == PanelKind::Settings) {
+            if (right) return;
+            if (x >= popupWidth() - 76 && x <= popupWidth() - 24 && y >= 24 && y <= 56) {
                 closePanel();
+                return;
+            }
+            if (x >= 24 && x < 24 + 3 * 142 && y >= 92 && y <= 128) {
+                recordingShortcut = -1;
+                settingsTab = int((x - 24) / 142);
+                settingsFeedback.clear();
+                buildSettings();
+                InvalidateRect(panel, nullptr, FALSE);
+                return;
+            }
+            const int index = menuHit(x, y);
+            if (index >= 0) {
+                menuFocus = index;
+                settingsCommand(menuRows[size_t(index)].command);
+            }
             return;
         }
         if (panelKind == PanelKind::Functions || panelKind == PanelKind::Files) {
@@ -4201,24 +5170,11 @@ struct App {
             rounded(D2D1::RectF(8.f - spread, 10.f - spread, w - 8 + spread, h - 6 + spread), {43, 55, 79, 4},
                     20.f + spread);
         rounded(D2D1::RectF(8, 8, w - 8, h - 8), Theme::surface, 20);
-        if (panelKind == PanelKind::Functions || panelKind == PanelKind::Files)
+        if (menuPanel())
             paintMenu(rt, b);
         else if (panelKind == PanelKind::Color)
             paintColor(rt, b);
-        else if (panelKind == PanelKind::About) {
-            set(Theme::text);
-            rt->DrawTextW(L"InkHorn", 7, format.Get(), D2D1::RectF(26, 26, w - 26, 54), b);
-            const wchar_t *lines[] = {L"轻量 PDF 阅读与批注", L"在纸面书写，在两侧空白拖动翻阅。",
-                                      L"再次点击已选工具可以调整参数。", L"笔迹写入 PDF，可直接分享文件。",
-                                      L"Ctrl+O 打开 · Ctrl+S 保存 · F11 全屏"};
-            set(Theme::muted);
-            for (int i = 0; i < 5; ++i)
-                rt->DrawTextW(lines[i], UINT32(wcslen(lines[i])), smallFormat.Get(),
-                              D2D1::RectF(26, 66.f + i * 26, w - 26, 92.f + i * 26), b);
-            rounded(D2D1::RectF(24, 220, 304, 260), Theme::inset, 13);
-            set(Theme::text);
-            rt->DrawTextW(L"关闭", 2, format.Get(), D2D1::RectF(150, 230, 196, 255), b);
-        } else {
+        else {
             const wchar_t *titles[] = {L"指针", L"笔 1", L"笔 2", L"橡皮", L"荧光笔", L"形状"};
             set({96, 107, 128, 255});
             rt->DrawTextW(titles[tool], UINT32(wcslen(titles[tool])), smallFormat.Get(),
@@ -4341,7 +5297,7 @@ struct App {
                 a->moveFileDrag(screen);
                 return 0;
             }
-            if (a->panelKind == PanelKind::Functions || a->panelKind == PanelKind::Files) {
+            if (a->menuPanel()) {
                 const int index = a->menuHit(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
                 if (index != a->menuHover) {
                     a->menuHover = index;
@@ -4375,7 +5331,7 @@ struct App {
             a->colorDrag = 0;
             return 0;
         case WM_MOUSEWHEEL:
-            if (a->panelKind == PanelKind::Functions || a->panelKind == PanelKind::Files)
+            if (a->menuPanel())
                 a->popupMenuScroll(-GET_WHEEL_DELTA_WPARAM(w) / 120.0 * 72);
             return 0;
         case WM_POINTERENTER: {
@@ -4399,6 +5355,8 @@ struct App {
             }
             POINT p = info.ptPixelLocation;
             ScreenToClient(h, &p);
+            if (info.pointerType == PT_TOUCH && a->settingsTouchInput(m, GET_POINTERID_WPARAM(w), p.x / a->dpi(), p.y / a->dpi()))
+                return 0;
             if (m == WM_POINTERDOWN) {
                 if (a->gesture != Gesture::None)
                     a->finishGesture();
@@ -4434,17 +5392,19 @@ struct App {
             return 0;
         }
         case WM_POINTERCAPTURECHANGED:
+            a->settingsTouch = 0;
             a->fileDragCommand = 0;
             a->fileDragPointer = 0;
             a->popupDragging = false;
             a->colorDrag = 0;
             return 0;
+        case WM_SYSKEYDOWN:
+            if (w != VK_F10 || GetKeyState(VK_MENU) < 0) break;
+            [[fallthrough]];
         case WM_KEYDOWN:
-            if (w == 'F' && GetKeyState(VK_CONTROL) < 0) {
-                a->openSearch();
-                return 0;
-            }
             if (a->popupKey(w))
+                return 0;
+            if (a->shortcutKey(w))
                 return 0;
             if (w == VK_ESCAPE) {
                 a->closePanel();
@@ -4472,6 +5432,12 @@ struct App {
         mergeInsert = incoming ? int(sessions.size()) : -1;
         if (kind == PanelKind::Functions || kind == PanelKind::Files)
             buildMenu();
+        if (kind == PanelKind::Settings) {
+            finishGesture();
+            stopInertia();
+            SetFocus(window);
+            buildSettings();
+        }
         auto r = toolbar();
         const double w = popupWidth();
         const bool fromHeader = kind != PanelKind::Tool && kind != PanelKind::Color;
@@ -4479,6 +5445,10 @@ struct App {
                                     : (r.left - w - 8 >= 8 ? r.left - w - 8 : r.right + 8);
         POINT p{int(x * dpi()), int((fromHeader ? header() - 2 : r.top - 8) * dpi())};
         ClientToScreen(window, &p);
+        if (kind == PanelKind::Settings) {
+            p = {int((width() - w) * dpi() / 2), int((height() - popupHeight()) * dpi() / 2)};
+            ClientToScreen(window, &p);
+        }
         const SIZE pixels{LONG(std::ceil(w * dpi())), LONG(std::ceil(popupHeight() * dpi()))};
         MONITORINFO monitor{};
         monitor.cbSize = sizeof(monitor);
@@ -4492,7 +5462,7 @@ struct App {
         // The merge menu has an explicit lifetime in closePanel/clearMergeTarget instead.
         const DWORD popupStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE |
                                  (incoming ? WS_EX_TOPMOST : 0);
-        panel = CreateWindowExW(popupStyle, L"InkHornPanel", L"工具设置", WS_POPUP,
+        panel = CreateWindowExW(popupStyle, L"InkHornPanel", kind == PanelKind::Settings ? L"设置 — InkHorn" : L"工具设置", WS_POPUP,
                                 p.x, p.y, pixels.cx, pixels.cy,
                                 incoming ? nullptr : window, nullptr, instance, this);
         if (!panel)
@@ -4541,12 +5511,10 @@ struct App {
             ++a->fieldTextWrites;
         if (a->diagnostics.message(m, w, l, "edit"))
             a->invalidate();
-        if (m == WM_KEYDOWN && w == 'F' && GetKeyState(VK_CONTROL) < 0) {
-            a->openSearch();
-            return 0;
-        }
         if (m == WM_KEYDOWN && h == a->searchEdit &&
             a->searchKey(w, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0))
+            return 0;
+        if (m == WM_KEYDOWN && a->shortcutKey(w, true))
             return 0;
         if (m == WM_CHAR && (w == 6 || (h == a->searchEdit && (w == 1 || w == VK_RETURN || w == VK_ESCAPE))))
             return 0;
@@ -4574,10 +5542,10 @@ struct App {
         }
         if (!a)
             return DefWindowProcW(h, m, w, l);
-        if (mouseInputMessage(m) && !a->mouseInput(m))
-            return 0;
         if (a->diagnostics.message(m, w, l))
             a->invalidate();
+        if (mouseInputMessage(m) && !a->mouseInput(m))
+            return 0;
         switch (m) {
         case WM_ENTERSIZEMOVE:
             a->cancelTitlePress();
@@ -4833,9 +5801,10 @@ struct App {
             return 0;
         }
         case WM_LBUTTONDOWN:
+            if (a->middlePan) return 0;
             if (a->penContact.active())
                 return 0;
-            SetFocus(h);
+            if (!a->smoke) SetFocus(h);
             a->penNear = a->penTemporaryEraser = false;
             if (a->gesture != Gesture::None)
                 a->finishGesture();
@@ -4876,7 +5845,7 @@ struct App {
                 }
                 return 0;
             }
-            if (a->mouseContact && (w & MK_LBUTTON) && a->gesture != Gesture::None) {
+            if (a->mouseContact && (w & (a->middlePan ? MK_MBUTTON : MK_LBUTTON)) && a->gesture != Gesture::None) {
                 a->move(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
                 a->presentInkIfDue();
             } else if (!a->mouseContact)
@@ -4891,6 +5860,8 @@ struct App {
             a->invalidate();
             return 0;
         case WM_LBUTTONUP:
+            a->endDriverPan();
+            if (a->middlePan) return 0;
             if (a->titlePressed) {
                 POINT screen{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                 ClientToScreen(h, &screen);
@@ -4904,11 +5875,54 @@ struct App {
             ReleaseCapture();
             a->presentInkIfDue();
             return 0;
-        case WM_MOUSEWHEEL: {
+        case WM_MBUTTONDOWN:
+            a->middleDown(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi(),
+                          a->navigationPenMessage || a->recentPenInput());
+            return 0;
+        case WM_MBUTTONUP:
+            if (a->middlePan) {
+                a->releaseAt(GET_X_LPARAM(l) / a->dpi(), GET_Y_LPARAM(l) / a->dpi());
+                a->mouseContact = a->middlePan = false;
+                if (GetCapture() == h) ReleaseCapture();
+                a->refreshCursor();
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_POINTERWHEEL:
+        case WM_POINTERHWHEEL: {
             POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             ScreenToClient(h, &p);
-            a->scroll(GET_WHEEL_DELTA_WPARAM(w) / 120.0, p.x / a->dpi(), p.y / a->dpi());
+            const bool mouseWheel = m == WM_MOUSEWHEEL || m == WM_MOUSEHWHEEL;
+            const bool control = (mouseWheel && (GET_KEYSTATE_WPARAM(w) & MK_CONTROL)) || GetKeyState(VK_CONTROL) < 0;
+            const bool shift = (mouseWheel && (GET_KEYSTATE_WPARAM(w) & MK_SHIFT)) || GetKeyState(VK_SHIFT) < 0;
+            const bool horizontal = m == WM_MOUSEHWHEEL || m == WM_POINTERHWHEEL;
+            POINTER_INPUT_TYPE type{};
+            const bool knownPointer = !mouseWheel && GetPointerType(GET_POINTERID_WPARAM(w), &type);
+            const bool explicitOtherDevice = (mouseWheel && a->navigationTouchpadMessage) || (knownPointer && type != PT_PEN);
+            const bool precise = !explicitOtherDevice && ((knownPointer && type == PT_PEN) ||
+                                 (mouseWheel && a->navigationPenMessage) || a->driverPanActive || a->recentPenInput());
+            const auto action = wheelAction(horizontal, control, GetKeyState(VK_MENU) < 0, shift);
+            a->diagnostics.navigation(precise,
+                                      action == WheelAction::Zoom ? "zoom" : action == WheelAction::Horizontal ? "horizontal" : "vertical");
+            a->scroll(GET_WHEEL_DELTA_WPARAM(w) / 120.0, p.x / a->dpi(), p.y / a->dpi(), inputTime(),
+                      horizontal, control, GetKeyState(VK_MENU) < 0, shift, precise);
             return 0;
+        }
+        case WM_HSCROLL:
+        case WM_VSCROLL:
+            if (a->legacyScroll(m == WM_HSCROLL, w, l)) return 0;
+            break;
+        case WM_GESTURE: {
+            GESTUREINFO info{sizeof(info)};
+            if (GetGestureInfo(reinterpret_cast<HGESTUREINFO>(l), &info)) {
+                if (a->zoomGesture(info)) {
+                    CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(l));
+                    return 0;
+                }
+                if (info.dwID == GID_END) a->pinchDistance = 0;
+            }
+            break; // DefWindowProc owns unhandled handles, including GID_BEGIN / GID_END.
         }
         case WM_POINTERENTER:
         case WM_POINTERLEAVE: {
@@ -4969,7 +5983,8 @@ struct App {
                             a->toolbarContains(p.x / a->dpi(), p.y / a->dpi()))
                             a->down(p.x / a->dpi(), p.y / a->dpi());
                         else
-                            a->beginPan(p.x / a->dpi(), p.y / a->dpi(), true);
+                            a->beginPan(p.x / a->dpi(), p.y / a->dpi(), false,
+                                        a->pageAt(p.x / a->dpi(), p.y / a->dpi()) < 0);
                     } else if (a->activePointer != id)
                         return 0;
                     else if (m == WM_POINTERUP) {
@@ -4995,6 +6010,7 @@ struct App {
             return 0;
         case WM_CANCELMODE:
             a->moveCancelled = true;
+            a->pinchDistance = 0;
             KillTimer(h, windowDragTimer);
             a->cancelTitlePress();
             a->clearMergeTarget();
@@ -5003,6 +6019,8 @@ struct App {
             return 0;
         case WM_ACTIVATEAPP:
             if (!w) {
+                a->pinchDistance = 0;
+                a->spacePanHeld = a->altWheelZoomed = false;
                 a->moveCancelled = true;
                 KillTimer(h, windowDragTimer);
                 a->cancelTitlePress();
@@ -5015,6 +6033,20 @@ struct App {
         case WM_ACTIVATE:
             if (LOWORD(w) != WA_INACTIVE)
                 lastActive = a;
+            else
+                a->spacePanHeld = false;
+            break;
+        case WM_KILLFOCUS:
+            a->endDriverPan();
+            a->lastPenInput = -1e12;
+            a->pinchDistance = 0;
+            a->spacePanHeld = a->altWheelZoomed = false;
+            break;
+        case WM_KEYUP:
+            if (w == VK_SPACE) { a->holdPan(false); return 0; }
+            break;
+        case WM_SYSKEYUP:
+            if (w == VK_MENU && a->altWheelZoomed) { a->altWheelZoomed = false; return 0; }
             break;
         case WM_COMMAND:
             if (LOWORD(w) == searchId && HIWORD(w) == EN_CHANGE && a->searchVisible) {
@@ -5032,6 +6064,9 @@ struct App {
                 return 0;
             }
             break;
+        case WM_SYSKEYDOWN:
+            if (w != VK_F10 || GetKeyState(VK_MENU) < 0) break;
+            [[fallthrough]];
         case WM_KEYDOWN: {
             if (w == VK_ESCAPE && a->titlePressed) {
                 a->cancelTitlePress();
@@ -5049,21 +6084,14 @@ struct App {
                 }
                 return 0;
             }
-            if (GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 && (w == 'D' || w == 'L')) {
-                a->closePanel();
-                if (w == 'D')
-                    a->toggleDiagnostics();
-                else
-                    a->openDiagnosticDirectory();
-                return 0;
-            }
             if (a->popupKey(w))
                 return 0;
-            bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
-            if (w == VK_F11) {
-                a->toggleFullscreen();
+            if (w == VK_SPACE && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_MENU) >= 0) {
+                a->holdPan(true);
                 return 0;
             }
+            if (a->shortcutKey(w))
+                return 0;
             if (w == VK_ESCAPE) {
                 a->stopInertia();
                 if (a->searchVisible)
@@ -5080,67 +6108,9 @@ struct App {
                     a->toggleFullscreen();
                 return 0;
             }
-            if (ctrl) {
-                switch (w) {
-                case 'F':
-                    a->openSearch();
-                    return 0;
-                case 'C':
-                    a->copyText();
-                    return 0;
-                case 'O':
-                    a->open(a->dialog(false));
-                    return 0;
-                case 'S':
-                    a->save(shift);
-                    return 0;
-                case 'W':
-                    a->closeDocument(a->active);
-                    return 0;
-                case VK_TAB:
-                    if (!a->sessions.empty())
-                        a->activate((a->active + int(a->sessions.size()) + (shift ? -1 : 1)) %
-                                    int(a->sessions.size()));
-                    return 0;
-                case 'Z':
-                    a->undo(shift);
-                    return 0;
-                case 'Y':
-                    a->undo(true);
-                    return 0;
-                case 'G':
-                    SetFocus(a->pageEdit);
-                    SendMessageW(a->pageEdit, EM_SETSEL, 0, -1);
-                    return 0;
-                }
-            }
             if (w == VK_F3 && a->searchVisible) {
-                a->navigateSearch(shift ? -1 : 1);
+                a->navigateSearch(GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
                 return 0;
-            }
-            if (w == VK_DELETE) {
-                a->deleteSelected();
-                return 0;
-            }
-            int t = -1;
-            if (w == '1')
-                t = 0;
-            if (w == '2')
-                t = 1;
-            if (w == '3')
-                t = 2;
-            if (w == 'E')
-                t = 3;
-            if (w == 'H')
-                t = 4;
-            if (w == 'S')
-                t = 5;
-            if (t >= 0) {
-                a->finishGesture();
-                a->tool = t;
-                a->selected.reset();
-                a->closePanel();
-                a->invalidate();
             }
             return 0;
         }
@@ -5227,7 +6197,8 @@ int run(HINSTANCE instance, int show) {
         return std::find(startupArguments.begin(), startupArguments.end(), flag) != startupArguments.end();
     };
     const bool testMode = hasFlag(L"--smoke-test") || hasFlag(L"--performance-test") ||
-        hasFlag(L"--profile-scroll") || hasFlag(L"--ink-quality-test") || hasFlag(L"--short-stroke-test");
+        hasFlag(L"--profile-scroll") || hasFlag(L"--ink-quality-test") || hasFlag(L"--short-stroke-test") ||
+        hasFlag(L"--settings-test") || hasFlag(L"--navigation-test");
     wchar_t executable[32768]{};
     GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable)));
     std::wstring brokerName = instanceKey(executable);
@@ -5360,6 +6331,18 @@ int run(HINSTANCE instance, int show) {
     ShowWindow(h, a.smoke ? SW_HIDE : show);
     UpdateWindow(h);
     a.layout();
+    if (hasFlag(L"--navigation-test")) {
+        a.paint();
+        const bool ok = a.navigationCheck();
+        DestroyWindow(h);
+        return ok ? 0 : 10;
+    }
+    if (hasFlag(L"--settings-test")) {
+        a.paint();
+        const bool ok = a.settingsCheck();
+        DestroyWindow(h);
+        return ok ? 0 : 9;
+    }
     if (shortStrokes) {
         const bool ok = a.shortStrokeCheck();
         DestroyWindow(h);
@@ -5437,7 +6420,7 @@ int run(HINSTANCE instance, int show) {
             a.animateScroll(1 + i * .016);
         homeOk = homeOk && !a.wheel.active() && std::abs(a.doc()->scroll - beforeWheel - 90) < .01;
         a.scroll(-1, x, y, 2);
-        a.beginPan(4, y, false);
+        a.beginPan(4, y);
         homeOk = homeOk && !a.wheel.active() && !a.momentum.active();
         a.finishGesture();
         a.doc()->scroll = 0;
@@ -5664,6 +6647,9 @@ int run(HINSTANCE instance, int show) {
         a.move(x + 40, y + 20, .8, true);
         a.finishGesture();
         bool ok = homeOk && a.doc()->history.current().size() == 1 && a.graphics();
+        const bool settingsOk = a.settingsCheck();
+        smokeReport << "settings: " << settingsOk << '\n';
+        ok = ok && settingsOk;
         a.functionsMenu();
         ok = ok && a.panelKind == App::PanelKind::Functions &&
              std::none_of(a.menuRows.begin(), a.menuRows.end(),
@@ -5875,6 +6861,8 @@ int run(HINSTANCE instance, int show) {
         ok = ok && a.sessions.size() == 1 && App::detached.empty();
         a.fileMenu();
         auto popup = a.panel;
+        const auto splitShortcuts = a.shortcuts;
+        a.shortcuts.assign(0, {'Q', 1});
         SendMessageW(popup, WM_LBUTTONDOWN, MK_LBUTTON, filePoint);
         SendMessageW(popup, WM_MOUSEMOVE, MK_LBUTTON, filePoint); // Below the drag threshold.
         ok = ok && a.sessions.size() == 1 && a.fileDragCommand == 1000;
@@ -5891,6 +6879,15 @@ int run(HINSTANCE instance, int show) {
             smokeReport << "split-state: " << ok << " scale=" << split->doc()->scale
                         << " scroll=" << split->doc()->scroll << " cursor=" << split->doc()->history.cursor << '\n';
         if (split) {
+            ok = ok && split->shortcuts.match({'Q', 1}) == 1;
+            split->runCommand(9);
+            const auto settingsPanel = split->panel;
+            a.shortcuts = splitShortcuts;
+            a.savePreferences();
+            ok = ok && split->shortcuts.match({'O', 1}) == 1 && !split->shortcuts.match({'Q', 1}) &&
+                 split->panel == settingsPanel && split->panelKind == App::PanelKind::Settings;
+            split->closePanel();
+            smokeReport << "settings-multiple-windows: " << ok << '\n';
             RECT splitBounds{};
             GetWindowRect(split->window, &splitBounds);
             ok = ok && splitBounds.right - splitBounds.left == originalBounds.right - originalBounds.left &&
@@ -6201,6 +7198,7 @@ int run(HINSTANCE instance, int show) {
 
             // Fullscreen detachment uses 60% per dimension, leaving the source fullscreen.
             a.toggleFullscreen();
+            ok = ok && (GetWindowLongPtrW(h, GWL_STYLE) & WS_HSCROLL);
             RECT fullBounds{};
             GetWindowRect(h, &fullBounds);
             a.down(a.fileLeft() + 20, 2); // Reveal the F11 header, just as a real file-list drag does.
@@ -6231,6 +7229,7 @@ int run(HINSTANCE instance, int show) {
                 ok = false;
             a.toggleFullscreen();
             smokeReport << "split-fullscreen-size: " << ok << '\n';
+            ok = ok && (GetWindowLongPtrW(h, GWL_STYLE) & WS_HSCROLL);
             a.closeWindow();
             ok = ok && IsWindow(split->window) && split->engine && App::windows.size() == 1;
             smokeReport << "close-original: " << ok << " windows=" << App::windows.size() << '\n';

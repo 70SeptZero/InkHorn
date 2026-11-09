@@ -41,7 +41,7 @@ bool InputDiagnostics::start(const std::filesystem::path &directory) {
         lastId_ = 0;
         lastFlags_ = lastMask_ = lastButtons_ = ~0u;
         lines_ = 0;
-        stream_ << "InkHorn pen input diagnostic v2\n"
+        stream_ << "InkHorn pen input diagnostic v5\n"
                    "Application window messages only; no global hooks; no PDF contents/paths.\n"
                    "Pen flags: BARREL=1 INVERTED=2 ERASER=4. Unchanged UPDATE sampled at 100 ms.\n"
                    "Current mapping: BARREL/ERASER/INVERTED => temporary whole-stroke eraser.\n"
@@ -155,6 +155,27 @@ bool InputDiagnostics::message(UINT message, WPARAM w, LPARAM l, const char *sur
     case WM_MBUTTONUP:
         name = "MOUSE_MIDDLE_UP";
         break;
+    case WM_MOUSEWHEEL:
+        name = "MOUSE_WHEEL";
+        break;
+    case WM_MOUSEHWHEEL:
+        name = "MOUSE_HWHEEL";
+        break;
+    case WM_POINTERWHEEL:
+        name = "POINTER_WHEEL";
+        break;
+    case WM_POINTERHWHEEL:
+        name = "POINTER_HWHEEL";
+        break;
+    case WM_HSCROLL:
+        name = "HSCROLL";
+        break;
+    case WM_VSCROLL:
+        name = "VSCROLL";
+        break;
+    case WM_GESTURE:
+        name = "GESTURE";
+        break;
     case WM_XBUTTONDOWN:
         name = "MOUSE_X_DOWN";
         break;
@@ -173,10 +194,49 @@ bool InputDiagnostics::message(UINT message, WPARAM w, LPARAM l, const char *sur
     std::ostringstream out;
     out << surface << ' ' << name << " wParam=0x" << std::hex << w << " lParam=0x" << l << " extraInfo=0x"
         << GetMessageExtraInfo() << std::dec << " Ctrl=" << (GetKeyState(VK_CONTROL) < 0)
-        << " Shift=" << (GetKeyState(VK_SHIFT) < 0) << " Alt=" << (GetKeyState(VK_MENU) < 0);
+        << " Shift=" << (GetKeyState(VK_SHIFT) < 0) << " Alt=" << (GetKeyState(VK_MENU) < 0)
+        << " asyncCtrl=" << (GetAsyncKeyState(VK_CONTROL) < 0);
+    std::wstring detail;
+    if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL ||
+        message == WM_POINTERWHEEL || message == WM_POINTERHWHEEL) {
+        out << " delta=" << short(HIWORD(w));
+        detail = L"  增量=" + std::to_wstring(short(HIWORD(w)));
+        if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+            out << " wheelCtrl=" << bool(LOWORD(w) & MK_CONTROL);
+    }
+    if (message == WM_HSCROLL || message == WM_VSCROLL) {
+        static const char *commands[]{"LINE_BACK", "LINE_FORWARD", "PAGE_BACK", "PAGE_FORWARD",
+                                      "THUMB_POSITION", "THUMB_TRACK", "START", "END", "END_SCROLL"};
+        const unsigned command = LOWORD(w);
+        out << " command=" << command << "(" << (command < 9 ? commands[command] : "UNKNOWN")
+            << ") position=" << HIWORD(w) << " childControl=" << bool(l);
+        detail = L"  命令=" + std::to_wstring(command);
+    }
+    if (message == WM_GESTURE) {
+        GESTUREINFO info{sizeof(info)};
+        if (GetGestureInfo(reinterpret_cast<HGESTUREINFO>(l), &info)) {
+            out << " id=" << info.dwID << " flags=" << info.dwFlags << " distance=" << info.ullArguments
+                << " instance=" << info.dwInstanceID;
+            detail = L"  手势=" + std::to_wstring(info.dwID);
+        }
+    }
     write(out.str());
     const std::string label(name);
-    last_ = std::wstring(label.begin(), label.end()) + L"  输入码=" + std::to_wstring(w);
+    last_ = std::wstring(label.begin(), label.end()) +
+            (detail.empty() ? L"  输入码=" + std::to_wstring(w) : detail);
     return true;
+}
+void InputDiagnostics::navigation(bool precise, const char *action, int axis) {
+    if (!active()) return;
+    std::ostringstream out;
+    out << "NAVIGATION precise=" << precise << " axis=" << axis << " action=" << action;
+    write(out.str());
+}
+void InputDiagnostics::scrollRange(const SCROLLINFO &info) {
+    if (!active()) return;
+    std::ostringstream out;
+    out << "HORIZONTAL_RANGE min=" << info.nMin << " max=" << info.nMax
+        << " page=" << info.nPage << " position=" << info.nPos;
+    write(out.str());
 }
 } // namespace pb
